@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+outputs/
+*.pt
+*.safetensors
+*.bin
+*.ckpt
+*.pth
+*.npy
+*.npz
+.env
+wandb/
+
+# Trained SKILL/Memory checkpoints (produced by scripts.train_and_eval)
+# Each ckpt is a snapshot of skills/ + memory/; can be large after many runs.
+# Base state (skills/, memory/) is committed; ckpts/ is per-user runtime.
+ckpts/
+results/
+logs/
+archive/
+splits/

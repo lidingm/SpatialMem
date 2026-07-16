@@ -1,0 +1,250 @@
+{
+  "schema_version": "1.0",
+  "scenes": {
+    "bedroom": {
+      "width": {
+        "count": 9,
+        "mean": 4.6032,
+        "M2": 2.330206,
+        "std": 0.5088
+      },
+      "height": {
+        "count": 9,
+        "mean": 3.008,
+        "M2": 0.246257,
+        "std": 0.1654
+      },
+      "depth": {
+        "count": 9,
+        "mean": 4.0498,
+        "M2": 3.656082,
+        "std": 0.6374
+      },
+      "floor_area": {
+        "count": 9,
+        "mean": 18.8999,
+        "M2": 205.96073,
+        "std": 4.7838
+      },
+      "last_updated": 1783445521
+    },
+    "kitchen": {
+      "width": {
+        "count": 8,
+        "mean": 5.7315,
+        "M2": 39.022732,
+        "std": 2.2086
+      },
+      "height": {
+        "count": 8,
+        "mean": 3.5036,
+        "M2": 5.493933,
+        "std": 0.8287
+      },
+      "depth": {
+        "count": 8,
+        "mean": 4.7586,
+        "M2": 6.066365,
+        "std": 0.8708
+      },
+      "floor_area": {
+        "count": 8,
+        "mean": 28.7057,
+        "M2": 1901.208084,
+        "std": 15.4159
+      },
+      "last_updated": 1783445351
+    }
+  },
+  "candidates": {
+    "bathroom": {
+      "width": {
+        "count": 3,
+        "mean": 4.5574,
+        "M2": 1e-06,
+        "std": 0.0006
+      },
+      "height": {
+        "count": 3,
+        "mean": 2.4059,
+        "M2": 0.0,
+        "std": 0.0001
+      },
+      "depth": {
+        "count": 3,
+        "mean": 4.0889,
+        "M2": 1e-06,
+        "std": 0.0006
+      },
+      "floor_area": {
+        "count": 3,
+        "mean": 18.6349,
+        "M2": 4.8e-05,
+        "std": 0.004
+      },
+      "last_updated": 1783445235
+    },
+    "dining room": {
+      "width": {
+        "count": 2,
+        "mean": 4.9739,
+        "M2": 0.0,
+        "std": 0.0003
+      },
+      "height": {
+        "count": 2,
+        "mean": 3.9682,
+        "M2": 0.0,
+        "std": 0.0002
+      },
+      "depth": {
+        "count": 2,
+        "mean": 5.0273,
+        "M2": 0.0,
+        "std": 0.0003
+      },
+      "floor_area": {
+        "count": 2,
+        "mean": 25.0049,
+        "M2": 1.4e-05,
+        "std": 0.0027
+      },
+      "last_updated": 1783445085
+    },
+    "conference room": {
+      "width": {
+        "count": 3,
+        "mean": 11.1959,
+        "M2": 53.72789,
+        "std": 4.2319
+      },
+      "height": {
+        "count": 3,
+        "mean": 5.2342,
+        "M2": 0.245668,
+        "std": 0.2862
+      },
+      "depth": {
+        "count": 3,
+        "mean": 6.9208,
+        "M2": 2.960464,
+        "std": 0.9934
+      },
+      "floor_area": {
+        "count": 3,
+        "mean": 81.6889,
+        "M2": 4204.767304,
+        "std": 37.4378
+      },
+      "last_updated": 1783445122
+    },
+    "home office": {
+      "width": {
+        "count": 3,
+        "mean": 4.5286,
+        "M2": 2.214068,
+        "std": 0.8591
+      },
+      "height": {
+        "count": 3,
+        "mean": 3.577,
+        "M2": 1.008952,
+        "std": 0.5799
+      },
+      "depth": {
+        "count": 3,
+        "mean": 3.5087,
+        "M2": 0.520915,
+        "std": 0.4167
+      },
+      "floor_area": {
+        "count": 3,
+        "mean": 16.2477,
+        "M2": 64.817394,
+        "std": 4.6482
+      },
+      "last_updated": 1783445145
+    },
+    "library": {
+      "width": {
+        "count": 1,
+        "mean": 5.1637,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 2.89,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 4.5628,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "floor_area": {
+        "count": 1,
+        "mean": 23.5611,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783443574
+    },
+    "storage room": {
+      "width": {
+        "count": 1,
+        "mean": 4.5944,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 1.8812,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 1.9028,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "floor_area": {
+        "count": 1,
+        "mean": 8.7422,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783443776
+    },
+    "living room": {
+      "width": {
+        "count": 1,
+        "mean": 4.578,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 5.1762,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 9.9345,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "floor_area": {
+        "count": 1,
+        "mean": 45.4798,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783443810
+    }
+  }
+}

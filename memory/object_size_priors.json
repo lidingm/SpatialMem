@@ -1,0 +1,952 @@
+{
+  "schema_version": "1.0",
+  "objects": {
+    "door": {
+      "width": {
+        "count": 20,
+        "mean": 0.5717,
+        "M2": 2.888677,
+        "std": 0.38
+      },
+      "height": {
+        "count": 20,
+        "mean": 1.1314,
+        "M2": 8.83938,
+        "std": 0.6648
+      },
+      "depth": {
+        "count": 20,
+        "mean": 0.9782,
+        "M2": 8.559943,
+        "std": 0.6542
+      },
+      "last_updated": 1783443637
+    },
+    "stool": {
+      "width": {
+        "count": 5,
+        "mean": 0.4157,
+        "M2": 0.128591,
+        "std": 0.1604
+      },
+      "height": {
+        "count": 5,
+        "mean": 0.5585,
+        "M2": 0.141751,
+        "std": 0.1684
+      },
+      "depth": {
+        "count": 5,
+        "mean": 0.4837,
+        "M2": 0.487539,
+        "std": 0.3123
+      },
+      "last_updated": 1783382934
+    },
+    "tv": {
+      "width": {
+        "count": 13,
+        "mean": 0.4392,
+        "M2": 1.110316,
+        "std": 0.2922
+      },
+      "height": {
+        "count": 13,
+        "mean": 0.5171,
+        "M2": 1.016111,
+        "std": 0.2796
+      },
+      "depth": {
+        "count": 13,
+        "mean": 0.6774,
+        "M2": 2.16899,
+        "std": 0.4085
+      },
+      "last_updated": 1783445154
+    },
+    "whiteboard": {
+      "width": {
+        "count": 18,
+        "mean": 0.7129,
+        "M2": 7.111803,
+        "std": 0.6286
+      },
+      "height": {
+        "count": 18,
+        "mean": 0.8818,
+        "M2": 6.651638,
+        "std": 0.6079
+      },
+      "depth": {
+        "count": 18,
+        "mean": 0.8213,
+        "M2": 6.888498,
+        "std": 0.6186
+      },
+      "last_updated": 1783441155
+    },
+    "basket": {
+      "width": {
+        "count": 12,
+        "mean": 0.4131,
+        "M2": 1.17266,
+        "std": 0.3126
+      },
+      "height": {
+        "count": 12,
+        "mean": 0.235,
+        "M2": 0.120005,
+        "std": 0.1
+      },
+      "depth": {
+        "count": 12,
+        "mean": 0.4339,
+        "M2": 2.611633,
+        "std": 0.4665
+      },
+      "last_updated": 1783401276
+    },
+    "cup": {
+      "width": {
+        "count": 20,
+        "mean": 0.1587,
+        "M2": 0.146226,
+        "std": 0.0855
+      },
+      "height": {
+        "count": 20,
+        "mean": 0.1143,
+        "M2": 0.092916,
+        "std": 0.0682
+      },
+      "depth": {
+        "count": 20,
+        "mean": 0.261,
+        "M2": 0.915891,
+        "std": 0.214
+      },
+      "last_updated": 1783407107
+    },
+    "table": {
+      "width": {
+        "count": 36,
+        "mean": 0.8474,
+        "M2": 44.155432,
+        "std": 1.1075
+      },
+      "height": {
+        "count": 36,
+        "mean": 0.5053,
+        "M2": 8.801567,
+        "std": 0.4945
+      },
+      "depth": {
+        "count": 36,
+        "mean": 0.8285,
+        "M2": 25.14262,
+        "std": 0.8357
+      },
+      "last_updated": 1783445155
+    },
+    "sofa": {
+      "width": {
+        "count": 12,
+        "mean": 0.6582,
+        "M2": 1.614302,
+        "std": 0.3668
+      },
+      "height": {
+        "count": 12,
+        "mean": 0.5681,
+        "M2": 1.41986,
+        "std": 0.344
+      },
+      "depth": {
+        "count": 12,
+        "mean": 0.9094,
+        "M2": 6.469206,
+        "std": 0.7342
+      },
+      "last_updated": 1783445538
+    },
+    "backpack": {
+      "width": {
+        "count": 5,
+        "mean": 0.4307,
+        "M2": 0.151891,
+        "std": 0.1743
+      },
+      "height": {
+        "count": 5,
+        "mean": 0.3399,
+        "M2": 0.075663,
+        "std": 0.123
+      },
+      "depth": {
+        "count": 5,
+        "mean": 0.4735,
+        "M2": 0.452353,
+        "std": 0.3008
+      },
+      "last_updated": 1783437880
+    },
+    "dishwasher": {
+      "width": {
+        "count": 11,
+        "mean": 0.1976,
+        "M2": 0.222671,
+        "std": 0.1423
+      },
+      "height": {
+        "count": 11,
+        "mean": 0.6473,
+        "M2": 1.516291,
+        "std": 0.3713
+      },
+      "depth": {
+        "count": 11,
+        "mean": 0.5381,
+        "M2": 0.954764,
+        "std": 0.2946
+      },
+      "last_updated": 1783443555
+    },
+    "chair": {
+      "width": {
+        "count": 23,
+        "mean": 0.6012,
+        "M2": 4.45788,
+        "std": 0.4403
+      },
+      "height": {
+        "count": 23,
+        "mean": 0.6578,
+        "M2": 7.789022,
+        "std": 0.5819
+      },
+      "depth": {
+        "count": 23,
+        "mean": 0.7783,
+        "M2": 13.967592,
+        "std": 0.7793
+      },
+      "last_updated": 1783445259
+    },
+    "fireplace": {
+      "width": {
+        "count": 6,
+        "mean": 0.9181,
+        "M2": 0.850742,
+        "std": 0.3766
+      },
+      "height": {
+        "count": 6,
+        "mean": 0.972,
+        "M2": 0.343273,
+        "std": 0.2392
+      },
+      "depth": {
+        "count": 6,
+        "mean": 0.8834,
+        "M2": 0.64865,
+        "std": 0.3288
+      },
+      "last_updated": 1783445154
+    },
+    "nightstand": {
+      "width": {
+        "count": 7,
+        "mean": 0.6396,
+        "M2": 0.568146,
+        "std": 0.2849
+      },
+      "height": {
+        "count": 7,
+        "mean": 0.5031,
+        "M2": 0.472338,
+        "std": 0.2598
+      },
+      "depth": {
+        "count": 7,
+        "mean": 0.5206,
+        "M2": 0.324425,
+        "std": 0.2153
+      },
+      "last_updated": 1783443397
+    },
+    "bookshelf": {
+      "width": {
+        "count": 7,
+        "mean": 0.502,
+        "M2": 0.380029,
+        "std": 0.233
+      },
+      "height": {
+        "count": 7,
+        "mean": 0.9278,
+        "M2": 4.202944,
+        "std": 0.7749
+      },
+      "depth": {
+        "count": 7,
+        "mean": 0.4852,
+        "M2": 0.492915,
+        "std": 0.2654
+      },
+      "last_updated": 1783445539
+    },
+    "television": {
+      "width": {
+        "count": 9,
+        "mean": 0.605,
+        "M2": 0.980217,
+        "std": 0.33
+      },
+      "height": {
+        "count": 9,
+        "mean": 0.7687,
+        "M2": 1.035764,
+        "std": 0.3392
+      },
+      "depth": {
+        "count": 9,
+        "mean": 0.6922,
+        "M2": 0.761417,
+        "std": 0.2909
+      },
+      "last_updated": 1783443555
+    },
+    "refrigerator": {
+      "width": {
+        "count": 6,
+        "mean": 0.7132,
+        "M2": 0.3703,
+        "std": 0.2484
+      },
+      "height": {
+        "count": 6,
+        "mean": 1.2369,
+        "M2": 1.776906,
+        "std": 0.5442
+      },
+      "depth": {
+        "count": 6,
+        "mean": 1.3672,
+        "M2": 3.360346,
+        "std": 0.7484
+      },
+      "last_updated": 1783443555
+    },
+    "guitar": {
+      "width": {
+        "count": 5,
+        "mean": 0.3022,
+        "M2": 0.081348,
+        "std": 0.1276
+      },
+      "height": {
+        "count": 5,
+        "mean": 0.864,
+        "M2": 0.501052,
+        "std": 0.3166
+      },
+      "depth": {
+        "count": 5,
+        "mean": 0.4204,
+        "M2": 0.073505,
+        "std": 0.1212
+      },
+      "last_updated": 1783443651
+    }
+  },
+  "candidates": {
+    "trash can": {
+      "width": {
+        "count": 1,
+        "mean": 0.1359,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.5117,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 0.2889,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783364931
+    },
+    "fan": {
+      "width": {
+        "count": 3,
+        "mean": 0.2433,
+        "M2": 0.003457,
+        "std": 0.0339
+      },
+      "height": {
+        "count": 3,
+        "mean": 0.2552,
+        "M2": 0.028488,
+        "std": 0.0974
+      },
+      "depth": {
+        "count": 3,
+        "mean": 0.2906,
+        "M2": 0.024767,
+        "std": 0.0909
+      },
+      "last_updated": 1783379641
+    },
+    "printer": {
+      "width": {
+        "count": 2,
+        "mean": 0.4632,
+        "M2": 0.099516,
+        "std": 0.2231
+      },
+      "height": {
+        "count": 2,
+        "mean": 0.3087,
+        "M2": 0.000698,
+        "std": 0.0187
+      },
+      "depth": {
+        "count": 2,
+        "mean": 0.6606,
+        "M2": 0.002091,
+        "std": 0.0323
+      },
+      "last_updated": 1783379949
+    },
+    "power strip": {
+      "width": {
+        "count": 3,
+        "mean": 0.5012,
+        "M2": 0.469465,
+        "std": 0.3956
+      },
+      "height": {
+        "count": 3,
+        "mean": 0.2308,
+        "M2": 0.062411,
+        "std": 0.1442
+      },
+      "depth": {
+        "count": 3,
+        "mean": 0.8124,
+        "M2": 0.919659,
+        "std": 0.5537
+      },
+      "last_updated": 1783411209
+    },
+    "monitor": {
+      "width": {
+        "count": 4,
+        "mean": 0.6475,
+        "M2": 0.154544,
+        "std": 0.1966
+      },
+      "height": {
+        "count": 4,
+        "mean": 0.2544,
+        "M2": 0.098047,
+        "std": 0.1566
+      },
+      "depth": {
+        "count": 4,
+        "mean": 0.592,
+        "M2": 0.572091,
+        "std": 0.3782
+      },
+      "last_updated": 1783443483
+    },
+    "laptop": {
+      "width": {
+        "count": 4,
+        "mean": 0.2725,
+        "M2": 0.069277,
+        "std": 0.1316
+      },
+      "height": {
+        "count": 4,
+        "mean": 0.2286,
+        "M2": 0.008691,
+        "std": 0.0466
+      },
+      "depth": {
+        "count": 4,
+        "mean": 0.3969,
+        "M2": 0.095027,
+        "std": 0.1541
+      },
+      "last_updated": 1783390542
+    },
+    "desk": {
+      "width": {
+        "count": 4,
+        "mean": 0.7269,
+        "M2": 0.688954,
+        "std": 0.415
+      },
+      "height": {
+        "count": 4,
+        "mean": 0.7104,
+        "M2": 0.598624,
+        "std": 0.3869
+      },
+      "depth": {
+        "count": 4,
+        "mean": 0.7208,
+        "M2": 0.690217,
+        "std": 0.4154
+      },
+      "last_updated": 1783443255
+    },
+    "suitcase": {
+      "width": {
+        "count": 2,
+        "mean": 0.7392,
+        "M2": 0.007016,
+        "std": 0.0592
+      },
+      "height": {
+        "count": 2,
+        "mean": 0.2855,
+        "M2": 0.002372,
+        "std": 0.0344
+      },
+      "depth": {
+        "count": 2,
+        "mean": 0.2414,
+        "M2": 0.006702,
+        "std": 0.0579
+      },
+      "last_updated": 1783384071
+    },
+    "ceiling light": {
+      "width": {
+        "count": 2,
+        "mean": 0.6282,
+        "M2": 0.452188,
+        "std": 0.4755
+      },
+      "height": {
+        "count": 2,
+        "mean": 0.1825,
+        "M2": 0.001968,
+        "std": 0.0314
+      },
+      "depth": {
+        "count": 2,
+        "mean": 0.3746,
+        "M2": 0.030667,
+        "std": 0.1238
+      },
+      "last_updated": 1783441155
+    },
+    "telephone": {
+      "width": {
+        "count": 3,
+        "mean": 0.1103,
+        "M2": 0.001985,
+        "std": 0.0257
+      },
+      "height": {
+        "count": 3,
+        "mean": 0.3312,
+        "M2": 0.037192,
+        "std": 0.1113
+      },
+      "depth": {
+        "count": 3,
+        "mean": 0.1645,
+        "M2": 0.008382,
+        "std": 0.0529
+      },
+      "last_updated": 1783437880
+    },
+    "plant": {
+      "width": {
+        "count": 1,
+        "mean": 0.5275,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.3905,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 1.367,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783390542
+    },
+    "trash bin": {
+      "width": {
+        "count": 3,
+        "mean": 0.2246,
+        "M2": 0.002303,
+        "std": 0.0277
+      },
+      "height": {
+        "count": 3,
+        "mean": 0.283,
+        "M2": 0.0055,
+        "std": 0.0428
+      },
+      "depth": {
+        "count": 3,
+        "mean": 0.21,
+        "M2": 0.031675,
+        "std": 0.1028
+      },
+      "last_updated": 1783395877
+    },
+    "paper bag": {
+      "width": {
+        "count": 1,
+        "mean": 0.0838,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.2784,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 0.3891,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783397243
+    },
+    "window": {
+      "width": {
+        "count": 2,
+        "mean": 1.1745,
+        "M2": 0.025834,
+        "std": 0.1137
+      },
+      "height": {
+        "count": 2,
+        "mean": 1.2953,
+        "M2": 0.110932,
+        "std": 0.2355
+      },
+      "depth": {
+        "count": 2,
+        "mean": 1.5083,
+        "M2": 1.074298,
+        "std": 0.7329
+      },
+      "last_updated": 1783399288
+    },
+    "counter": {
+      "width": {
+        "count": 3,
+        "mean": 0.4737,
+        "M2": 0.101061,
+        "std": 0.1835
+      },
+      "height": {
+        "count": 3,
+        "mean": 0.8963,
+        "M2": 0.073568,
+        "std": 0.1566
+      },
+      "depth": {
+        "count": 3,
+        "mean": 0.9211,
+        "M2": 0.225809,
+        "std": 0.2744
+      },
+      "last_updated": 1783399524
+    },
+    "pillow": {
+      "width": {
+        "count": 1,
+        "mean": 1.5653,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.4513,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 1.0452,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783401921
+    },
+    "microwave": {
+      "width": {
+        "count": 4,
+        "mean": 0.5377,
+        "M2": 0.203343,
+        "std": 0.2255
+      },
+      "height": {
+        "count": 4,
+        "mean": 0.544,
+        "M2": 0.399767,
+        "std": 0.3161
+      },
+      "depth": {
+        "count": 4,
+        "mean": 1.3232,
+        "M2": 3.427194,
+        "std": 0.9256
+      },
+      "last_updated": 1783443652
+    },
+    "shoe rack": {
+      "width": {
+        "count": 1,
+        "mean": 0.5705,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.4028,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 0.355,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783407107
+    },
+    "radiator": {
+      "width": {
+        "count": 3,
+        "mean": 0.4234,
+        "M2": 0.129316,
+        "std": 0.2076
+      },
+      "height": {
+        "count": 3,
+        "mean": 0.7368,
+        "M2": 0.353117,
+        "std": 0.3431
+      },
+      "depth": {
+        "count": 3,
+        "mean": 0.5309,
+        "M2": 0.047828,
+        "std": 0.1263
+      },
+      "last_updated": 1783443637
+    },
+    "cutting board": {
+      "width": {
+        "count": 2,
+        "mean": 0.2215,
+        "M2": 0.047439,
+        "std": 0.154
+      },
+      "height": {
+        "count": 2,
+        "mean": 0.2188,
+        "M2": 0.001112,
+        "std": 0.0236
+      },
+      "depth": {
+        "count": 2,
+        "mean": 0.4322,
+        "M2": 0.056324,
+        "std": 0.1678
+      },
+      "last_updated": 1783409827
+    },
+    "shoes": {
+      "width": {
+        "count": 1,
+        "mean": 0.3304,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.2447,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 0.3253,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783411062
+    },
+    "stove": {
+      "width": {
+        "count": 4,
+        "mean": 0.3551,
+        "M2": 0.121168,
+        "std": 0.174
+      },
+      "height": {
+        "count": 4,
+        "mean": 0.1863,
+        "M2": 0.015069,
+        "std": 0.0614
+      },
+      "depth": {
+        "count": 4,
+        "mean": 0.353,
+        "M2": 0.192912,
+        "std": 0.2196
+      },
+      "last_updated": 1783441390
+    },
+    "mirror": {
+      "width": {
+        "count": 1,
+        "mean": 0.3118,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.3557,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 0.5335,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783439635
+    },
+    "towel": {
+      "width": {
+        "count": 3,
+        "mean": 0.3485,
+        "M2": 0.105023,
+        "std": 0.1871
+      },
+      "height": {
+        "count": 3,
+        "mean": 0.4577,
+        "M2": 0.122384,
+        "std": 0.202
+      },
+      "depth": {
+        "count": 3,
+        "mean": 0.3965,
+        "M2": 0.052665,
+        "std": 0.1325
+      },
+      "last_updated": 1783441630
+    },
+    "bed": {
+      "width": {
+        "count": 2,
+        "mean": 1.5327,
+        "M2": 1.470616,
+        "std": 0.8575
+      },
+      "height": {
+        "count": 2,
+        "mean": 1.0368,
+        "M2": 0.096377,
+        "std": 0.2195
+      },
+      "depth": {
+        "count": 2,
+        "mean": 1.4845,
+        "M2": 1.543789,
+        "std": 0.8786
+      },
+      "last_updated": 1783443351
+    },
+    "bathtub": {
+      "width": {
+        "count": 2,
+        "mean": 0.7408,
+        "M2": 0.034777,
+        "std": 0.1319
+      },
+      "height": {
+        "count": 2,
+        "mean": 0.4628,
+        "M2": 0.115693,
+        "std": 0.2405
+      },
+      "depth": {
+        "count": 2,
+        "mean": 0.298,
+        "M2": 0.000244,
+        "std": 0.011
+      },
+      "last_updated": 1783443352
+    },
+    "clock": {
+      "width": {
+        "count": 1,
+        "mean": 0.3126,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.2986,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 0.1351,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783443483
+    },
+    "computer mouse": {
+      "width": {
+        "count": 1,
+        "mean": 0.0903,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "height": {
+        "count": 1,
+        "mean": 0.0656,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "depth": {
+        "count": 1,
+        "mean": 0.1674,
+        "M2": 0.0,
+        "std": 0.0
+      },
+      "last_updated": 1783445538
+    }
+  }
+}
