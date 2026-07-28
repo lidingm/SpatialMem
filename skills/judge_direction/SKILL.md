@@ -20,10 +20,11 @@ Works for all difficulty levels.
 # Parameters
 
 Extract ONLY bare object names — never full sentences or descriptions.
+Do not provide placeholder instance IDs such as `<id_of_chair>` or `chair_instance_id`. Pass object-name parameters and let `direction_computation` resolve Checker-validated instances internally.
 
 - `reference_target` (str, **REQUIRED**): anchor for the direction judgment ("is X to the left of **Y**" → Y). When the question says "to my left/right", this is the same as `viewpoint_target` (the person's own position is the anchor).
 - `target_target` (str, **REQUIRED**): object whose direction is asked ("is **X** to the left of Y" → X).
-- `viewpoint_type` (str): `"camera"` (default) or `"object"`.
+- `viewpoint_type` (str): `"camera"` or `"object"`. If `viewpoint_target` is present, set `"object"`; otherwise use `"camera"`.
   - `"camera"`: observer is the camera at a specific video frame; forward = camera's own optical axis toward `reference_target`. Use when the question says "from the camera / from this viewpoint" or no explicit human position is mentioned.
   - `"object"`: observer is a person standing at `viewpoint_target`. Use when the question explicitly says "standing by X" or "if I am at X".
 - `viewpoint_target` (str): **WHERE the person physically stands** (their position). Required when `viewpoint_type="object"`. **NOT the object they are looking at.**
@@ -53,9 +54,9 @@ Extract ONLY bare object names — never full sentences or descriptions.
 # Tool Sequence
 
 1. `depth_estimation`.
-2. `object_segmentation` × K — one call per unique name in `{reference_target, target_target, viewpoint_target}`.
+2. `object_segmentation` × K — one call per unique name in `{reference_target, target_target, viewpoint_target, facing_target}`.
 3. `instance_3d_localization`.
-4. `direction_computation` — instance IDs resolved by label; forward direction determined by viewpoint mode:
+4. `direction_computation` — pass the target names, not invented IDs; final instance IDs are resolved by Checker. The tool returns the direction label plus `angle_from_forward_deg`, `lr_angle_deg`, and `fb_angle_deg`. Forward direction is determined by viewpoint mode:
    - camera mode: forward = camera → reference
    - object mode, viewpoint ≠ reference (Case A): forward = viewpoint → reference
    - object mode, viewpoint ≈ reference (Case B "standing at X facing Y"): forward = reference → facing(Y)
@@ -65,5 +66,9 @@ Extract ONLY bare object names — never full sentences or descriptions.
 None yet.
 
 # Examples
+
+None yet.
+
+# Checker
 
 None yet.

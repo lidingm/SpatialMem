@@ -25,18 +25,22 @@ Output JSON:
     "reasoning": "1 sentence: why this tool + these parameters given the accumulated evidence"
 }}
 
-CRITICAL: `tool` MUST be exactly one of these ten names — do NOT invent new tools:
+CRITICAL: `tool` MUST be exactly one of these eleven names — do NOT invent new tools:
   depth_estimation, bev_generation, novel_view_synthesis, object_segmentation,
   annotation_localization, instance_3d_localization, instance_counting,
-  distance_computation, direction_computation, scene_size_computation
+  distance_computation, direction_computation, object_size_computation,
+  scene_size_computation
 
-If none of the ten tools can produce the needed evidence, pick the closest one that CAN run and let the Reflector handle the gap.
+If none of the eleven tools can produce the needed evidence, pick the closest one that CAN run and let the Reflector handle the gap.
 
 Guidelines:
 - Follow the planned tool unless the accumulated evidence CLEARLY indicates a different tool is needed (e.g., a dependency failed; a different object was detected).
-- Populate params by inspecting the accumulated evidence — e.g., pick a specific `obj_id` from the current `instance_3d_localization` output; pick the right `frame_index` for a camera-relative question.
+- Populate params by inspecting the accumulated evidence and the original question.
+- For `distance_computation`, `direction_computation`, and `object_size_computation`, prefer object-name params (`obj_a`, `obj_b`, `object_name`, `viewpoint_target`, `reference_target`, `target_target`, `facing_target`). The tool layer will call Checker and resolve the intended track/instance.
+- Use concrete integer instance IDs only if the accumulated evidence makes that ID unambiguous. Never pass placeholder strings such as `<id_of_chair>`, `chair_instance_id`, or `"id_of_chair"`.
+- For camera-relative questions, pick the right `frame_index`; for "standing by X" / "facing Y" questions, use `viewpoint_type="object"` with `viewpoint_target="X"` and `facing_target="Y"`.
 - For `object_segmentation`, the `text_prompt` should be as specific as needed to disambiguate but as terse as possible when counting all instances of a category.
-- For `distance_computation` and `direction_computation`, only invoke after `instance_3d_localization` has produced usable `obj_id_list`.
+- For `distance_computation`, `direction_computation`, and `object_size_computation`, only invoke after `instance_3d_localization` has produced usable `obj_id_list`.
 """
 
 

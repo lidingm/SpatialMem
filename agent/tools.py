@@ -1,18 +1,22 @@
 """Tool registry: register, describe, and dispatch all spatial reasoning tools.
 
 Migrated from the old `tool_registry.py`. All hardcoded paths now come from
-`agent.config`. Semantics of the ten tools are unchanged.
+`agent.config`. Semantics of the core tools are unchanged.
 """
 
 from __future__ import annotations
 
 import os
+import json
 import traceback
+import base64
+import io
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from agent.checker import Checker
 from agent.config import OUTPUTS_DIR
 
 
@@ -25,8 +29,9 @@ _DEBUG_TRACES = os.getenv("SPATIALMEM_DEBUG_TRACES", "0") == "1"
 
 TOOL_DESCRIPTIONS = """=== Available Tools ===
 
-You have 10 tools in two categories. Choose ONLY the tools needed for the question.
+You have 11 tools in two categories. Choose ONLY the tools needed for the question.
 Dependencies between tools are handled automatically at runtime — you only need to plan the logical sequence.
+Distance, direction, counting, and object-size tools may internally call the passive Checker role to verify target objects from annotated frames. If SAM3 finds zero tracks for a required target, Checker answers directly from the raw frames and geometry is skipped.
 
 ────────────────────────────────────────────
 [A] Visual Generation Tools — produce visual/geometric evidence
@@ -46,14 +51,14 @@ Dependencies between tools are handled automatically at runtime — you only nee
    NOT needed for: pure object detection/counting where 3D is unnecessary
 
 2. bev_generation
-   What it does: Renders a bird's-eye-view (top-down) color image from the 3D point cloud. Shows the scene layout as viewed from directly above.
+   What it does: Renders a bird's-eye-view (top-down) color image from the DA3 depth back-projected 3D point cloud. It uses DA3 confidence filtering (keeps the top 75% confidence points by default), so the map is useful spatial evidence but can still be sparse or noisy when depth/pose confidence is poor.
    When to use: Questions about spatial layout, relative positions of objects in the floor plan, or understanding the overall room structure.
    Parameters: none
    Output in context: BEV color image with spatial extent in meters
    Depends on: depth_estimation (needs point cloud)
 
 3. novel_view_synthesis
-   What it does: Renders the scene from a new camera viewpoint using 3D Gaussian Splatting. You specify which source frame to start from and how to move the virtual camera.
+   What it does: Renders the scene from a new camera viewpoint using DA3 3D Gaussian Splatting. If the current DA3 prediction has no gaussians, the tool may re-run DA3 with infer_gs=True before rendering. You specify which source frame to start from and how to move the virtual camera.
    When to use: Exploring occluded regions, verifying what's behind an object, spatial imagination tasks ("what would you see if you moved to position X").
    Parameters:
      - frame_index (int): which frame's camera to start from (default: 0)
@@ -61,20 +66,21 @@ Dependencies between tools are handled automatically at runtime — you only nee
      - angle_deg (float): rotation amount in degrees for yaw/pitch (default: 30)
      - distance (float): translation amount in meters for move_* (default: 0.2)
    Output in context: rendered RGB image from the new viewpoint
-   Depends on: depth_estimation (needs 3DGS model)
+   Depends on: depth_estimation (needs DA3-Giant/3DGS-capable model and gsplat)
 
 4. object_segmentation
-   What it does: Detects all instances of a specified object in each frame independently using SAM3 with a text prompt. Returns per-frame binary masks, bounding boxes (xyxy pixel coords), and confidence scores.
+   What it does: Uses SAM3 video segmentation/tracking to detect and track all instances of a specified object across the input frames. Returns per-frame binary masks, bounding boxes (xyxy pixel coords), confidence scores, and cross-frame obj_ids for each tracked physical instance.
    When to use: Any task that involves specific objects — counting, measuring, locating, comparing objects.
    Parameters:
-     - text_prompt (str): a descriptive text prompt to identify the target object. Be as specific as needed to find the RIGHT object.
-       * For counting all of a category: use the bare category name (e.g. "chair", "shelf", "door").
-       * For a specific object among similar ones: add visual descriptors (e.g. "black office chair", "wooden dining table").
-     - object_category (str): the simplified canonical class name for memory bookkeeping.
+     - text_prompt (str): the short plain object noun from the question
+       (e.g. "chair", "door", "sofa"). SAM3 only segments short terms well, so
+       use the question's own word — keep it to 1-2 words.
+     - object_category (str): same short noun, for memory bookkeeping.
    Output in context (per frame):
      - masks: (N_det, H, W) boolean masks
      - boxes: (N_det, 4) bounding boxes in xyxy pixel coordinates
      - scores: (N_det,) detection confidence scores
+     - obj_ids: stable cross-frame SAM3 track IDs
    Does NOT need depth_estimation to run. Can be called independently.
 
 5. annotation_localization
@@ -99,6 +105,8 @@ Dependencies between tools are handled automatically at runtime — you only nee
      - merged_scores: (K,) best detection confidence per instance
      - merged_labels: list of object category labels, indexed by instance ID
      - frame_to_global: mapping from per-frame detection index to global instance ID
+     - instances: human-readable labels consistent with saved annotations, e.g. "chair 1", with frames and scores
+   Notes: The summary intentionally reports candidate labels/frames/scores before Checker review. Final object choices are reported later by Checker/final_localization.
    Depends on: depth_estimation AND (object_segmentation OR annotation_localization)
 
 7. distance_computation
@@ -108,8 +116,9 @@ Dependencies between tools are handled automatically at runtime — you only nee
      - object_to_camera: distance between an object centroid and a camera position at a specific frame
    Parameters:
      - mode (str): "object_to_object" or "object_to_camera"
-     - obj_a_id (int), obj_b_id (int): instance IDs for object_to_object
-     - obj_id (int), frame_index (int): for object_to_camera
+     - obj_a, obj_b (str): object category names for object_to_object; pass these whenever known
+     - obj (str), frame_index (int): object category name and camera frame for object_to_camera
+     - obj_a_id, obj_b_id, obj_id (int, optional): pre-resolved instance IDs
    Depends on: instance_3d_localization
 
 8. direction_computation
@@ -119,14 +128,16 @@ Dependencies between tools are handled automatically at runtime — you only nee
      - If `facing` is absent: forward = viewpoint → reference object (default: person implicitly faces the reference)
      - If viewpoint_type="camera": forward = camera's own optical axis toward reference
    Parameters:
-     - viewpoint (int): instance ID (if viewpoint_type="object") or frame index (if viewpoint_type="camera") — WHERE the observer stands
+     - viewpoint_target / reference_target / target_target / facing_target (str, optional): object category names; prefer these whenever known so Checker can validate tracks and resolve the final instance internally
      - viewpoint_type (str): "camera" or "object"
-     - reference (int): instance ID of the anchor object (direction is relative to this)
+     - viewpoint (int, optional): concrete instance ID if viewpoint_type="object", or frame index if viewpoint_type="camera"; do NOT pass placeholder strings such as "<id_of_chair>"
+     - reference (int, optional): concrete instance ID of the anchor object; do NOT pass placeholder strings
      - reference_type (str): "object" (almost always)
-     - target (int): instance ID of the object whose direction is asked
+     - target (int, optional): concrete instance ID of the object whose direction is asked; do NOT pass placeholder strings
      - target_type (str): "object" (almost always)
-     - facing (int, optional): instance ID of the object the person is LOOKING AT — defines the forward direction. Required when viewpoint == reference (otherwise forward is undefined). Omit if the person implicitly faces the reference.
+     - facing (int, optional): concrete instance ID of the object the person is LOOKING AT — defines the forward direction. Required when viewpoint == reference (otherwise forward is undefined). Omit if the person implicitly faces the reference.
      - facing_type (str): "object" (default)
+   Output includes: direction label, lr_angle_deg, fb_angle_deg, and angle_from_forward_deg (unsigned 0-180 degrees from observer forward to reference→target).
    Depends on: instance_3d_localization, depth_estimation
 
 9. instance_counting
@@ -134,7 +145,16 @@ Dependencies between tools are handled automatically at runtime — you only nee
    Parameters: none
    Depends on: instance_3d_localization
 
-10. scene_size_computation
+10. object_size_computation
+   What it does: Computes a target object's 3D bounding-box size from Checker-validated instance geometry. Context summary reports bbox_size_xyz in meters, bbox volume, then the queried width/height/depth/longest/shortest value requested by `dimension`.
+   Parameters:
+     - object_name / obj / target / object_category (str): target object category
+     - obj_id (int, optional): pre-resolved instance id
+     - dimension (str): width, height, depth, longest(default), or shortest
+     - unit (str): m(default) or cm
+   Depends on: instance_3d_localization, depth_estimation
+
+11. scene_size_computation
    What it does: Overall scene bounding box + floor area from the metric point cloud. Filters low-confidence and outlier points before measuring.
    Parameters: none
    Depends on: depth_estimation
@@ -143,9 +163,15 @@ Dependencies between tools are handled automatically at runtime — you only nee
 
 class ToolRegistry:
     def __init__(self, da3_tool=None, sam3_tool=None,
-                 output_root: str | Path | None = None):
+                 output_root: str | Path | None = None,
+                 llm=None, memory=None):
         self.da3_tool = da3_tool
         self.sam3_tool = sam3_tool
+        # Optional: when provided, instance_counting has a VLM review the annotated
+        # frames and correct the count; memory supplies the object size priors.
+        self.llm = llm
+        self.memory = memory
+        self.checker = Checker(llm, memory=memory) if llm is not None else None
         self.output_root = Path(output_root or OUTPUTS_DIR)
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._context: dict[str, Any] = {}
@@ -167,6 +193,12 @@ class ToolRegistry:
     def tool_log(self) -> list[dict]:
         return self._tool_log
 
+    def set_checker_notes(self, notes: str | None) -> None:
+        notes = str(notes or "").strip()
+        self._context["active_skill_checker_notes"] = notes
+        if self.checker is not None:
+            self.checker.set_checker_notes(notes)
+
     def get_context_summary(self) -> str:
         parts: list[str] = []
         if "da3_result" in self._context:
@@ -178,12 +210,18 @@ class ToolRegistry:
 
         if "bev" in self._context:
             bev = self._context["bev"]
+            conf_text = ""
+            if bev.get("use_conf"):
+                pct = float(bev.get("conf_percentile", 25.0))
+                conf_text = f", conf_filter=top {100.0 - pct:.0f}%"
             parts.append(f"[bev_generation] size={bev['raw_size_hw']}, "
-                         f"extent=({bev['xy_extent'][0]:.2f}m, {bev['xy_extent'][1]:.2f}m)")
+                         f"extent=({bev['xy_extent'][0]:.2f}m, {bev['xy_extent'][1]:.2f}m)"
+                         f"{conf_text}")
 
         if "nvs_results" in self._context:
             for nvs in self._context["nvs_results"]:
-                parts.append(f"[novel_view_synthesis] {nvs['movement']} {nvs['angle_deg']}deg from frame {nvs['frame_index']}")
+                img_path = f", image={nvs.get('image_path')}" if nvs.get("image_path") else ""
+                parts.append(f"[novel_view_synthesis] {nvs['movement']} {nvs['angle_deg']}deg from frame {nvs['frame_index']}{img_path}")
 
         if "all_seg_results" in self._context:
             all_seg = self._context["all_seg_results"]
@@ -196,20 +234,86 @@ class ToolRegistry:
         if "results_3d" in self._context:
             r3d = self._context["results_3d"]
             k = len(r3d.get("obj_id_list", []))
-            parts.append(f"[instance_3d_localization] {k} unique instances after 3D clustering:")
+            # Flag this as a pre-calibration candidate list: when instance_counting
+            # later runs a VLM review, ITS count supersedes this one.
+            parts.append(f"[instance_3d_localization] {k} candidate instance(s) after 3D "
+                         f"clustering (before any later review):")
+            instances = r3d.get("instances") or []
+            by_id = {int(it["id"]): it for it in instances if "id" in it}
             for i in r3d.get("obj_id_list", []):
-                pos = r3d["merged_positions"][i]
-                size = r3d["merged_bbox_size"][i]
-                sc = r3d["merged_scores"][i]
-                label = r3d.get("merged_labels", [""] * k)[i]
-                label_str = f", source={label}" if label else ""
-                parts.append(f"  instance {i}: center=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}), "
-                             f"bbox_size=({size[0]:.3f}, {size[1]:.3f}, {size[2]:.3f})m, "
-                             f"score={sc:.2f}{label_str}")
+                it = by_id.get(int(i))
+                if it is not None:
+                    parts.append(
+                        f"  {it.get('label', f'instance {i}')}: "
+                        f"frames={it.get('frames', [])}, score={float(it.get('score', 0.0)):.2f}"
+                    )
+                else:
+                    label = r3d.get("merged_labels", [""] * k)[i]
+                    name = f"{label} {i}" if label else f"instance {i}"
+                    parts.append(f"  {name}: frames=unknown, score={float(r3d['merged_scores'][i]):.2f}")
 
         if "counting" in self._context:
             c = self._context["counting"]
-            parts.append(f"[instance_counting] {c['total_unique']} unique instances, ids={c['obj_id_list']}")
+            # FINAL COUNT is the authoritative answer and must be unmistakable.
+            # Never print an id list next to it: after a VLM split/missed correction
+            # the count legitimately exceeds the number of surviving ids, and a
+            # reader who counts the ids instead of reading the number gets it wrong.
+            parts.append(f"[instance_counting] FINAL COUNT = {c['total_unique']} "
+                         f"— this is the authoritative number of unique instances; "
+                         f"use it directly as the count answer.")
+            cal = c.get("calibration")
+            if cal and cal.get("error") is None:
+                parts.append(f"  (3D clustering proposed {cal['base_count']}; a VLM reviewed "
+                             f"the annotated frames and corrected it to {cal['adjusted_count']})")
+                for a in cal.get("applied", []):
+                    parts.append(f"    - {a}")
+
+        if "checker_direct_answer" in self._context:
+            ans = self._context["checker_direct_answer"]
+            parts.append(f"[checker] raw-sample direct answer = {ans.get('answer')!r}; "
+                         f"reason={ans.get('reason', '')}")
+
+        for s in self._context.get("skill_summaries", []):
+            if s:
+                parts.append(str(s))
+
+        for s in self._context.get("checker_summaries", []):
+            if s:
+                parts.append(f"[checker] {s}")
+
+        if "final_localization_annotations" in self._context:
+            ann = self._context["final_localization_annotations"]
+            r3d = self._context.get("results_3d") or {}
+            instances = r3d.get("instances") or []
+            by_id = {int(it["id"]): it for it in instances if "id" in it}
+            targets = ann.get("targets", [])
+            parts.append(f"[final_localization] {len(targets)} final target localization(s) after Checker review:")
+            for t in ann.get("targets", []):
+                it = by_id.get(int(t.get("instance_id", -999999)))
+                center = t.get("center_3d_m") or (it or {}).get("center_3d_m")
+                size = t.get("bbox_size_m") or (it or {}).get("bbox_size_m")
+                geom = ""
+                if center is not None and size is not None:
+                    geom = (
+                        f", center=({float(center[0]):.3f}, {float(center[1]):.3f}, {float(center[2]):.3f})m"
+                        f", bbox_size=({float(size[0]):.3f}, {float(size[1]):.3f}, {float(size[2]):.3f})m"
+                    )
+                parts.append(
+                    f"  {t.get('instance_label')}: "
+                    f"keep={t.get('keep_frames')}{geom}"
+                )
+
+        if "object_size" in self._context:
+            osz = self._context["object_size"]
+            sx, sy, sz = osz.get("size_xyz_m", [0.0, 0.0, 0.0])
+            volume = float(osz.get("bbox_volume_m3", float(sx) * float(sy) * float(sz)))
+            label = osz.get("dimension_label") or osz.get("dimension") or "queried dimension"
+            value = osz.get("value")
+            unit = osz.get("unit", "m")
+            queried = f"; queried {label}={float(value):.3f}{unit}" if value is not None else ""
+            parts.append(f"[object_size_computation] {osz.get('object')}: "
+                         f"bbox_size_xyz=({sx:.3f}, {sy:.3f}, {sz:.3f})m, "
+                         f"bbox_volume={volume:.3f}m3{queried}")
 
         if "scene_size" in self._context:
             ss = self._context["scene_size"]
@@ -218,11 +322,91 @@ class ToolRegistry:
                          f"depth={ext[2]:.2f}m, floor_area={ss['floor_area']:.2f}m²")
 
         for entry in self._tool_log:
-            if entry.get("tool_name") in ("distance_computation", "direction_computation") \
+            if entry.get("tool_name") in (
+                "distance_computation", "direction_computation",
+            ) \
                and entry.get("success"):
                 parts.append(f"[{entry['tool_name']}] {entry.get('result_summary', '')}")
 
         return "\n".join(parts) if parts else "No tool results yet."
+
+    def get_visual_evidence_content(self, max_side: int = 640) -> list[dict]:
+        """Build multimodal evidence blocks for Reflector/Reconstructor/Finalizer.
+
+        Preference order:
+          1. Checker-final localization frames, if available.
+          2. Otherwise the prepared raw 32 input frames.
+        Then append BEV and every NVS render that exists.
+        """
+        content: list[dict] = []
+
+        final_ann = self._context.get("final_localization_annotations") or {}
+        frame_paths = final_ann.get("annotated_frames") or self._context.get("frame_paths") or []
+        if final_ann.get("annotated_frames"):
+            desc = (
+                "Visual evidence group A: Checker-final localization frames. "
+                "These are the 32 sample frames with only the final selected/kept target boxes drawn. "
+                "Use these to verify which tracks and frames were actually used by downstream geometry."
+            )
+            label = "final localization frame"
+        else:
+            desc = (
+                "Visual evidence group A: original input frames. "
+                "No final localization overlay has been produced yet, so these are the raw prepared 32 frames."
+            )
+            label = "raw input frame"
+        if frame_paths:
+            content.append({"type": "text", "text": desc})
+            for i, fp in enumerate(frame_paths):
+                self._append_image_block(content, fp, f"{label} {i}", max_side=max_side)
+
+        bev_path = self._context.get("bev", {}).get("image_path")
+        if bev_path:
+            content.append({
+                "type": "text",
+                "text": (
+                    "Visual evidence group B: BEV image. "
+                    "This is a top-down color projection from DA3 depth/pose back-projection; "
+                    "use it for overall room layout and object spatial arrangement, while remembering it may be sparse/noisy."
+                ),
+            })
+            self._append_image_block(content, bev_path, "BEV top-down image", max_side=max_side)
+
+        nvs_items = [n for n in self._context.get("nvs_results", []) if n.get("image_path")]
+        if nvs_items:
+            content.append({
+                "type": "text",
+                "text": (
+                    "Visual evidence group C: NVS render(s). "
+                    "These are DA3 3DGS novel-view renders from requested virtual camera motions; "
+                    "use them to inspect occlusion, alternate viewpoints, and spatial imagination evidence."
+                ),
+            })
+            for nvs in nvs_items:
+                label = (f"NVS image: frame {nvs.get('frame_index')} "
+                         f"{nvs.get('movement')} angle={nvs.get('angle_deg')} "
+                         f"distance={nvs.get('distance')}")
+                self._append_image_block(content, nvs["image_path"], label, max_side=max_side)
+
+        return content
+
+    @staticmethod
+    def _append_image_block(content: list[dict], path: str | Path, label: str,
+                            max_side: int = 640) -> None:
+        try:
+            from PIL import Image
+
+            p = Path(path)
+            im = Image.open(p).convert("RGB")
+            im.thumbnail((max_side, max_side))
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=85)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            content.append({"type": "text", "text": f"{label}: {p}"})
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        except Exception:
+            return
 
     def execute_tool(self, tool_name: str, params: dict,
                      frame_paths: list[str]) -> dict:
@@ -251,8 +435,9 @@ class ToolRegistry:
             "annotation_localization":   lambda: self._run_annotation_loc(frame_paths),
             "instance_3d_localization":  lambda: self._run_3d_loc(),
             "instance_counting":         lambda: self._run_counting(),
-            "distance_computation":      lambda: self._run_distance(params),
-            "direction_computation":     lambda: self._run_direction(params),
+            "distance_computation":      lambda: self._run_distance(params, frame_paths),
+            "direction_computation":     lambda: self._run_direction(params, frame_paths),
+            "object_size_computation":   lambda: self._run_object_size(params, frame_paths),
             "scene_size_computation":    lambda: self._run_scene_size(),
         }
         fn = dispatch_map.get(name)
@@ -285,10 +470,17 @@ class ToolRegistry:
         pred = self._context.get("da3_result", {}).get("prediction")
         if pred is None:
             raise RuntimeError("depth_estimation must be run first")
-        bev = self.da3_tool.make_bev(pred, output_dir=self.output_root / "da3")
+        bev = self.da3_tool.make_bev(
+            pred,
+            output_dir=self.output_root / "da3",
+            use_conf=True,
+            conf_percentile=25.0,
+        )
+        bev["image_path"] = str(self.output_root / "da3" / "bev_from_depth.png")
         self._context["bev"] = bev
         return {"summary": f"BEV generated: size {bev['raw_size_hw']}, "
-                           f"extent x={bev['xy_extent'][0]:.2f}m z={bev['xy_extent'][1]:.2f}m"}
+                           f"extent x={bev['xy_extent'][0]:.2f}m z={bev['xy_extent'][1]:.2f}m, "
+                           f"conf_filter=top 75%"}
 
     def _run_nvs(self, params):
         pred = self._context.get("da3_result", {}).get("prediction")
@@ -304,13 +496,16 @@ class ToolRegistry:
         ang = params.get("angle_deg", 30.0)
         dist = params.get("distance", 0.2)
 
+        stem = f"nvs_f{int(fi):04d}_{mov}"
         self.da3_tool.render_nvs(
             pred, frame_index=fi, movement=mov,
             angle_deg=ang, distance=dist,
             output_dir=self.output_root / "da3",
+            output_name=stem,
         )
         self._context.setdefault("nvs_results", []).append({
             "frame_index": fi, "movement": mov, "angle_deg": ang, "distance": dist,
+            "image_path": str(self.output_root / "da3" / f"{stem}.png"),
         })
         return {"summary": f"Novel view rendered: {mov} {ang}deg from frame {fi}"}
 
@@ -328,6 +523,8 @@ class ToolRegistry:
         # work / error than clustering every raw per-frame detection.
         track = self.sam3_tool.segment_video_track(input_paths, text_prompt=text_prompt)
         seg_results = self._video_track_to_seg_results(track, input_paths[0])
+        sam3_dir = self.output_root / "sam3" / self._safe_output_name(object_category or text_prompt)
+        self._save_sam3_track_outputs(seg_results, input_paths, text_prompt, sam3_dir)
 
         self._context.setdefault("all_seg_results", {})[text_prompt] = seg_results
         if object_category:
@@ -341,7 +538,51 @@ class ToolRegistry:
         per_frame = [f"frame{i}:{len(s['scores'])}" for i, s in enumerate(seg_results) if len(s["scores"]) > 0]
         return {"summary": f"Object segmentation done: prompt='{text_prompt}', "
                            f"{n_tracks} tracked instance(s), {total} detections across "
-                           f"{len(seg_results)} frames ({', '.join(per_frame)})"}
+                           f"{len(seg_results)} frames ({', '.join(per_frame)}); "
+                           f"saved to {sam3_dir}"}
+
+    @staticmethod
+    def _safe_output_name(name: str) -> str:
+        return "".join(ch if (ch.isalnum() or ch in "-_") else "_"
+                       for ch in str(name).strip().lower()) or "object"
+
+    @staticmethod
+    def _save_sam3_track_outputs(seg_results, frame_paths, text_prompt: str, output_dir: Path) -> None:
+        """Persist raw SAM3 video tracking outputs for debugging and audit."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        all_masks, all_boxes, all_scores, all_obj_ids, counts = [], [], [], [], []
+        for res in seg_results:
+            n = len(res.get("scores", []))
+            counts.append(n)
+            if n == 0:
+                continue
+            all_masks.append(np.asarray(res["masks"], dtype=bool))
+            all_boxes.append(np.asarray(res["boxes"], dtype=np.float32))
+            all_scores.append(np.asarray(res["scores"], dtype=np.float32))
+            all_obj_ids.extend([int(o) for o in res.get("obj_ids", [])])
+
+        total = int(sum(counts))
+        np.savez_compressed(
+            output_dir / "sam3_track.npz",
+            masks=np.concatenate(all_masks, axis=0) if total else np.empty((0,), dtype=bool),
+            boxes=np.concatenate(all_boxes, axis=0) if total else np.empty((0, 4), dtype=np.float32),
+            scores=np.concatenate(all_scores, axis=0) if total else np.empty((0,), dtype=np.float32),
+            obj_ids=np.asarray(all_obj_ids, dtype=np.int32),
+            counts=np.asarray(counts, dtype=np.int32),
+        )
+
+        metadata = {
+            "text_prompt": text_prompt,
+            "frames": [str(p) for p in frame_paths],
+            "per_frame_counts": counts,
+            "total_detections": total,
+            "unique_obj_ids": sorted({int(o) for o in all_obj_ids}),
+        }
+        (output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _video_track_to_seg_results(track, first_frame_path):
@@ -471,20 +712,31 @@ class ToolRegistry:
             raise RuntimeError("depth_estimation and object_segmentation must be run first")
 
         from tools.code_execution.instance_3d_localization import compute_instance_3d_positions
+        # frame_paths + object_name let it render the annotated frames into
+        # output_root/spatial/<object_name>/ (used by the counting calibration).
         r3d = compute_instance_3d_positions(
             seg_results=seg, depth=da3["depth"],
             intrinsics=da3["intrinsics"], extrinsics=da3["extrinsics"],
+            frame_paths=self._context.get("frame_paths"),
+            object_name=self._context.get("text_prompt"),
             output_dir=self.output_root / "spatial",
         )
         self._context["results_3d"] = r3d
         k = len(r3d.get("obj_id_list", []))
-        lines = [f"3D localization done: {k} unique instances (merged by 3D proximity)"]
+        lines = [f"3D localization done: {k} candidate instance(s) after 3D clustering"]
+        instances = r3d.get("instances") or []
+        by_id = {int(it["id"]): it for it in instances if "id" in it}
         for i in r3d.get("obj_id_list", []):
-            pos = r3d["merged_positions"][i]
-            size = r3d["merged_bbox_size"][i]
-            sc = r3d["merged_scores"][i]
-            lines.append(f"  instance {i}: center=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}), "
-                         f"bbox_size=({size[0]:.3f}, {size[1]:.3f}, {size[2]:.3f})m, score={sc:.2f}")
+            it = by_id.get(int(i))
+            if it is not None:
+                lines.append(
+                    f"  {it.get('label', f'instance {i}')}: "
+                    f"frames={it.get('frames', [])}, score={float(it.get('score', 0.0)):.2f}"
+                )
+            else:
+                label = r3d.get("merged_labels", [""] * k)[i]
+                name = f"{label} {i}" if label else f"instance {i}"
+                lines.append(f"  {name}: frames=unknown, score={float(r3d['merged_scores'][i]):.2f}")
         return {"summary": "\n".join(lines)}
 
     def _run_counting(self):
@@ -492,87 +744,76 @@ class ToolRegistry:
         if r3d is None:
             raise RuntimeError("instance_3d_localization must be run first")
         from tools.code_execution.instance_counting import count_unique_instances
-        c = count_unique_instances(r3d)
+        # When an llm is wired in, a VLM reviews the annotated frames and the count
+        # is recomputed from its structured corrections (missed/spurious/merge/split).
+        c = count_unique_instances(
+            r3d, llm=self.llm,
+            object_name=self._context.get("text_prompt"),
+            memory=self.memory,
+            checker_notes=self._context.get("active_skill_checker_notes", ""),
+        )
         self._context["counting"] = c
-        return {"summary": f"Instance counting done: {c['total_unique']} unique instances, "
-                           f"ids={c['obj_id_list']}"}
-
-    def _run_distance(self, params):
-        r3d = self._context.get("results_3d")
-        da3 = self._context.get("da3_result")
-        if r3d is None:
-            raise RuntimeError("instance_3d_localization must be run first")
-
-        from tools.code_execution.distance_computation import (
-            distance_bbox_to_bbox, distance_object_to_camera,
-        )
-        mode = params.get("mode", "object_to_object")
-        id_list = r3d["obj_id_list"]
-
-        if mode == "object_to_object":
-            a_id = params.get("obj_a_id", id_list[0] if len(id_list) > 0 else 0)
-            b_id = params.get("obj_b_id", id_list[1] if len(id_list) > 1 else 0)
-            a_idx = id_list.index(a_id) if a_id in id_list else 0
-            b_idx = id_list.index(b_id) if b_id in id_list else min(1, len(id_list) - 1)
-            # Use closest-point (bbox-to-bbox) distance, matching the VSI question phrasing
-            # "Measuring from the closest point of each object"
-            d = distance_bbox_to_bbox(
-                r3d["merged_bbox_min"][a_idx], r3d["merged_bbox_max"][a_idx],
-                r3d["merged_bbox_min"][b_idx], r3d["merged_bbox_max"][b_idx],
-            )
-            return {"summary": f"Closest-point distance between instance {a_id} and instance {b_id}: {d:.3f} meters"}
+        cal = c.get("calibration")
+        if cal and cal.get("summary"):
+            self._context.setdefault("checker_summaries", []).append(cal["summary"])
+        final_instances = c.get("final_instances") or []
+        if final_instances:
+            try:
+                from tools.code_execution.instance_3d_localization import (
+                    draw_final_localization_annotations,
+                )
+                final_locs = {}
+                for idx, it in enumerate(final_instances, start=1):
+                    label = str(it.get("label") or f"{self._context.get('text_prompt', 'object')} {idx}")
+                    key = label
+                    final_locs[key] = {
+                        "instance_id": int(it.get("id", idx)),
+                        "instance_label": label,
+                        "keep_frames": list(it.get("frames") or []),
+                        "dropped_frames": [],
+                        "reason": "final instance after count calibration",
+                        "boxes_2d": list(it.get("boxes_2d") or []),
+                        "center_3d_m": it.get("center_3d_m"),
+                        "bbox_size_m": it.get("bbox_size_m"),
+                        "original_label": it.get("original_label"),
+                    }
+                ann = draw_final_localization_annotations(
+                    r3d,
+                    self._context.get("frame_paths") or [],
+                    final_locs,
+                    self.output_root / "spatial" / "final_localization",
+                )
+                self._context["final_localization_annotations"] = ann
+            except Exception as e:  # noqa: BLE001 - visualization must not break counting
+                self._context["final_localization_annotation_error"] = str(e)
+        # FINAL COUNT must be unmistakable: after calibration the surviving id list
+        # can be shorter than the count (split/missed add without adding ids), so
+        # never let the reader infer the answer by counting ids.
+        parts = [f"Instance counting done: FINAL COUNT = {c['total_unique']}"]
+        if cal and cal.get("error") is None:
+            parts.append(f"  (3D clustering produced {cal['base_count']} candidate instance(s); "
+                         f"a VLM reviewed the annotated frames and corrected it to "
+                         f"{cal['adjusted_count']})")
+            parts += [f"    - {a}" for a in cal.get("applied", [])] or ["    - (no corrections)"]
+            parts.append(f"  Answer with FINAL COUNT = {c['total_unique']}.")
         else:
-            obj_id = params.get("obj_id", id_list[0] if id_list else 0)
-            fi = params.get("frame_index", 0)
-            idx = id_list.index(obj_id) if obj_id in id_list else 0
-            d = distance_object_to_camera(r3d["merged_positions"][idx], da3["extrinsics"], fi)
-            return {"summary": f"Distance from instance {obj_id} to camera at frame {fi}: {d:.3f} meters"}
+            parts.append(f"  instance ids={c['obj_id_list']}")
+        return {"summary": "\n".join(parts)}
 
-    def _resolve_position(self, pos_id, pos_type, r3d, da3):
-        from tools.code_execution.distance_computation import get_camera_position
-        if pos_type == "camera":
-            return get_camera_position(da3["extrinsics"], int(pos_id))
-        else:
-            id_list = r3d["obj_id_list"]
-            idx = id_list.index(pos_id) if pos_id in id_list else 0
-            return r3d["merged_positions"][idx]
+    def _run_distance(self, params, frame_paths):
+        from tools.code_execution.distance_computation import run_distance_task
+        result = run_distance_task(params, self._context, self.checker, frame_paths)
+        return {"summary": result["summary"]}
 
-    def _run_direction(self, params):
-        r3d = self._context.get("results_3d")
-        da3 = self._context.get("da3_result")
-        if r3d is None:
-            raise RuntimeError("instance_3d_localization must be run first")
+    def _run_direction(self, params, frame_paths):
+        from tools.code_execution.direction_computation import run_direction_task
+        result = run_direction_task(params, self._context, self.checker, frame_paths)
+        return {"summary": result["summary"]}
 
-        from tools.code_execution.direction_computation import compute_relative_direction
-
-        vp_type = params.get("viewpoint_type", "camera")
-        ref_type = params.get("reference_type", "object")
-        tgt_type = params.get("target_type", "object")
-
-        vp_id  = params.get("viewpoint", 0)
-        ref_id = params.get("reference", 0)
-        tgt_id = params.get("target", 1)
-        fac_id = params.get("facing")          # optional: object that defines forward direction
-        fac_type = params.get("facing_type", "object")
-
-        viewpoint_pos = self._resolve_position(vp_id, vp_type, r3d, da3)
-        reference_pos = self._resolve_position(ref_id, ref_type, r3d, da3)
-        target_pos    = self._resolve_position(tgt_id, tgt_type, r3d, da3)
-        facing_pos    = self._resolve_position(fac_id, fac_type, r3d, da3) if fac_id is not None else None
-
-        dr = compute_relative_direction(
-            viewpoint=viewpoint_pos, reference=reference_pos, target=target_pos,
-            facing=facing_pos,
-            extrinsics=da3["extrinsics"],
-        )
-
-        vp_label  = f"camera(frame {vp_id})"  if vp_type  == "camera" else f"instance {vp_id}"
-        ref_label = f"camera(frame {ref_id})"  if ref_type == "camera" else f"instance {ref_id}"
-        tgt_label = f"camera(frame {tgt_id})"  if tgt_type == "camera" else f"instance {tgt_id}"
-        fac_label = f" facing instance {fac_id}" if fac_id is not None else ""
-
-        return {"summary": f"Direction (from {vp_label}{fac_label}): {tgt_label} is {dr['direction']} of "
-                           f"{ref_label} (lr_angle={dr['lr_angle_deg']:.1f}deg, fb_angle={dr['fb_angle_deg']:.1f}deg)"}
+    def _run_object_size(self, params, frame_paths):
+        from tools.code_execution.object_size_computation import run_object_size_task
+        result = run_object_size_task(params, self._context, self.checker, frame_paths)
+        return {"summary": result["summary"]}
 
     def _run_scene_size(self):
         pts = self._context.get("points")

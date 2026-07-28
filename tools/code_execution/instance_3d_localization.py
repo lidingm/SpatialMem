@@ -105,6 +105,28 @@ def _aabb_iou_ios(min_a, max_a, min_b, max_b):
     return iou, ios
 
 
+def _maybe_annotate(result, seg_results, frame_paths, object_name, output_dir) -> None:
+    """Render the merged instances onto the frames (best-effort).
+
+    Called after every 3D clustering run so the annotated frames are always
+    available downstream (e.g. for the VLM count calibration). Never fatal: a
+    rendering problem must not take down the localization result.
+    """
+    if frame_paths is None or not object_name or not output_dir:
+        return
+    try:
+        ann = draw_instance_annotations(seg_results, result, frame_paths,
+                                        object_name, output_dir)
+        result["annotated_frames"] = ann["annotated_frames"]
+        result["instances"] = ann["instances"]
+        result["annotated_dir"] = ann["dir"]
+        result["annotated_frames_by_category"] = ann.get("annotated_frames_by_category", {})
+        result["instances_by_category"] = ann.get("instances_by_category", {})
+        result["annotated_dir_by_category"] = ann.get("annotated_dir_by_category", {})
+    except Exception as e:  # noqa: BLE001 - annotation is a nice-to-have
+        print(f"[instance_3d_localization] annotation skipped: {e}")
+
+
 def annotations_to_detections(
     annotations: dict,
     n_frames: int,
@@ -183,6 +205,8 @@ def compute_instance_3d_positions(
     ios_small_diag: float = 0.5,
     ios_large_diag: float = 1.2,
     centroid_frac: float = 0.30,
+    frame_paths: Sequence[str] | None = None,
+    object_name: str | None = None,
     output_dir: str | Path | None = None,
 ) -> dict:
     """Back-project per-frame detections to 3D, then merge into unique instances.
@@ -333,6 +357,8 @@ def compute_instance_3d_positions(
         }
         if output_dir:
             _save_results(result, output_dir)
+        # still render the (box-free) frames so downstream can see "nothing found"
+        _maybe_annotate(result, seg_results, frame_paths, object_name, output_dir)
         return result
 
     N = len(all_centroids)
@@ -377,19 +403,31 @@ def compute_instance_3d_positions(
     # Unlike a static pairwise pass, this is AGGLOMERATIVE: after two clusters
     # merge, their boxes are unioned and the combined cluster is compared, as a
     # whole, against the rest. So an object close to a cluster's overall extent
-    # (but not to any single original member) still gets absorbed. Repeats until
-    # no pair merges.
+    # (but not to any single original member) still gets absorbed.
+    #
+    # Two hard rules on top of the geometry:
+    #   (1) Clusters that CO-OCCUR in the same frame are NEVER merged — if two
+    #       detections show up in one image they are, by definition, distinct
+    #       physical objects, no matter how close in 3D.
+    #   (2) Each round merges the globally CLOSEST eligible pair (min centroid
+    #       distance), not the first found. So when a track is eligible with two
+    #       clusters, it joins the NEARER one; its frames then fold in, and if the
+    #       other cluster co-occurs with it, rule (1) blocks that second merge.
     clusters = [
         {"members": list(g_members[g]),
          "min": g_min[g].copy(),
          "max": g_max[g].copy(),
-         "label": g_label[g]}
+         "label": g_label[g],
+         "frames": {all_indices[m][0] for m in g_members[g]}}
         for g in range(n_groups)
     ]
 
-    def _clusters_merge(a: dict, b: dict) -> bool:
+    def _merge_dist(a: dict, b: dict):
+        """Return centroid distance if a,b MAY merge, else None."""
         if a["label"] != b["label"]:
-            return False
+            return None
+        if a["frames"] & b["frames"]:          # rule (1): co-occur in a frame
+            return None
         iou, ios = _aabb_iou_ios(a["min"], a["max"], b["min"], b["max"])
         ca = 0.5 * (a["min"] + a["max"])
         cb = 0.5 * (b["min"] + b["max"])
@@ -398,30 +436,31 @@ def compute_instance_3d_positions(
         smaller = min(diag_a, diag_b)
         # Size-adaptive IoS threshold: a fixed depth-noise displacement is a
         # bigger fraction of a small object, so its true-same-object IoS is lower.
-        # Ramp the required IoS with the smaller box's diagonal.
         t = np.clip(
             (smaller - ios_small_diag) / max(ios_large_diag - ios_small_diag, 1e-6),
             0.0, 1.0,
         )
         ios_thr = ios_threshold_small + t * (ios_threshold - ios_threshold_small)
         cdist = float(np.linalg.norm(ca - cb))
-        coincident = cdist <= centroid_frac * smaller
-        return iou >= iou_threshold or ios >= ios_thr or coincident
+        if iou >= iou_threshold or ios >= ios_thr or cdist <= centroid_frac * smaller:
+            return cdist
+        return None
 
-    merged_any = True
-    while merged_any:
-        merged_any = False
+    while True:
+        best = None  # (dist, a_idx, b_idx)
         for a in range(len(clusters)):
             for b in range(a + 1, len(clusters)):
-                if _clusters_merge(clusters[a], clusters[b]):
-                    clusters[a]["members"].extend(clusters[b]["members"])
-                    clusters[a]["min"] = np.minimum(clusters[a]["min"], clusters[b]["min"])
-                    clusters[a]["max"] = np.maximum(clusters[a]["max"], clusters[b]["max"])
-                    del clusters[b]
-                    merged_any = True
-                    break
-            if merged_any:
-                break
+                d = _merge_dist(clusters[a], clusters[b])
+                if d is not None and (best is None or d < best[0]):
+                    best = (d, a, b)
+        if best is None:
+            break
+        _, a, b = best  # merge the closest eligible pair (rule (2))
+        clusters[a]["members"].extend(clusters[b]["members"])
+        clusters[a]["min"] = np.minimum(clusters[a]["min"], clusters[b]["min"])
+        clusters[a]["max"] = np.maximum(clusters[a]["max"], clusters[b]["max"])
+        clusters[a]["frames"] |= clusters[b]["frames"]
+        del clusters[b]
 
     cluster_members: list[list[int]] = [c["members"] for c in clusters]
     det_to_cluster = {}
@@ -469,6 +508,7 @@ def compute_instance_3d_positions(
 
     if output_dir:
         _save_results(result, output_dir)
+    _maybe_annotate(result, seg_results, frame_paths, object_name, output_dir)
     return result
 
 
@@ -520,3 +560,341 @@ def print_instance_3d_summary(result: dict, text_prompt: str) -> None:
         label_str = f"  label={label}" if label else ""
         print(f'  Instance {i}: center=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})  '
               f'bbox=({size[0]:.3f}, {size[1]:.3f}, {size[2]:.3f})  score={sc:.2f}{label_str}')
+
+
+# ─── Instance annotation rendering ──────────────────────────────────────────
+
+# Distinct, human-nameable colours, so a downstream VLM can be told
+# "instance 1 is the red box".
+_PALETTE = [
+    ("red", (230, 25, 75)), ("blue", (0, 130, 200)), ("green", (60, 180, 75)),
+    ("orange", (245, 130, 48)), ("purple", (145, 30, 180)), ("cyan", (70, 240, 240)),
+    ("magenta", (240, 50, 230)), ("yellow", (255, 215, 0)), ("lime", (170, 255, 0)),
+    ("teal", (0, 128, 128)), ("pink", (255, 150, 200)), ("brown", (154, 99, 36)),
+]
+
+
+def _largest_cc(mask: np.ndarray) -> np.ndarray:
+    """Largest connected component of a boolean mask.
+
+    Stray speckles far from the object would otherwise blow the min/max box up
+    to many times the visible region. Returns the mask unchanged if scipy is
+    unavailable or there is only one component.
+    """
+    try:
+        from scipy import ndimage
+    except Exception:
+        return mask
+    lab, n = ndimage.label(mask)
+    if n <= 1:
+        return mask
+    sizes = ndimage.sum(mask, lab, range(1, n + 1))
+    return lab == (int(np.argmax(sizes)) + 1)
+
+
+def draw_instance_annotations(
+    seg_results: list[dict],
+    result: dict,
+    frame_paths: Sequence[str],
+    object_name: str,
+    output_dir: str | Path,
+) -> dict:
+    """Draw merged instances onto category-specific annotated frame sets.
+
+    Frames are written to `output_dir/<category>/frame-XX.png`. When a 3D
+    localization run contains multiple object prompts, each category gets its
+    own clean 32-frame overlay instead of one crowded all-object overlay.
+
+    Returns:
+        dict with compatibility fields (`annotated_frames`, `instances`, `dir`)
+        plus category-indexed fields:
+          annotated_frames_by_category: {category: [frame paths]}
+          instances_by_category: {category: [instance dicts]}
+          annotated_dir_by_category: {category: dir}
+    """
+    from PIL import Image as _Img, ImageDraw, ImageFont
+
+    def _safe_name(name: str) -> str:
+        return "".join(ch if (ch.isalnum() or ch in "-_") else "_"
+                       for ch in str(name).strip().lower()) or "object"
+
+    ids = list(result.get("obj_id_list", []))
+    id_color = {oid: _PALETTE[i % len(_PALETTE)][1] for i, oid in enumerate(ids)}
+    id_cname = {oid: _PALETTE[i % len(_PALETTE)][0] for i, oid in enumerate(ids)}
+
+    # Label each instance by ITS OWN category (seg_results may merge several
+    # prompts, e.g. "sofa" + "stove"), numbering restarts per category so the
+    # labels read "sofa 1", "sofa 2", "stove 1" rather than one shared counter.
+    merged_labels = result.get("merged_labels") or []
+
+    def _cat_of(oid: int) -> str:
+        lab = merged_labels[oid] if oid < len(merged_labels) else ""
+        return str(lab) if lab else str(object_name)
+
+    _seen: dict[str, int] = {}
+    id_label, id_cat = {}, {}
+    for oid in ids:
+        cat = _cat_of(oid)
+        _seen[cat] = _seen.get(cat, 0) + 1
+        id_cat[oid] = cat
+        id_label[oid] = f"{cat} {_seen[cat]}"
+
+    categories = list(dict.fromkeys(id_cat[oid] for oid in ids))
+    if not categories:
+        categories = [str(object_name)]
+
+    try:
+        import matplotlib
+        font = ImageFont.truetype(
+            str(Path(matplotlib.get_data_path()) / "fonts/ttf/DejaVuSans-Bold.ttf"), 15)
+    except Exception:
+        font = ImageFont.load_default()
+
+    f2g = result.get("frame_to_global") or []
+    annotated_by_cat: dict[str, list[str]] = {cat: [] for cat in categories}
+    dir_by_cat: dict[str, str] = {}
+    id_frames: dict[int, list[int]] = {oid: [] for oid in ids}
+    # per-instance 2D box set — kept so downstream (VLM calibration, reflector,
+    # skill distillation) can reason about WHERE each instance was seen, not just
+    # how many there were.
+    id_boxes: dict[int, list[dict]] = {oid: [] for oid in ids}
+
+    output_dir = Path(output_dir)
+    for cat in categories:
+        out_dir = output_dir / _safe_name(cat)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for stale in out_dir.glob("frame-*.png"):
+            stale.unlink()
+        dir_by_cat[cat] = str(out_dir)
+
+        for fi, path in enumerate(frame_paths):
+            img = _Img.open(path).convert("RGB")
+            dr = ImageDraw.Draw(img)
+            if fi < len(seg_results) and fi < len(f2g):
+                seg = seg_results[fi]
+                masks = seg.get("masks")
+                for li in range(len(seg.get("scores", []))):
+                    gid = int(f2g[fi][li])
+                    if gid < 0 or masks is None or id_cat.get(gid) != cat:
+                        continue
+                    mask = np.asarray(masks[li], bool)
+                    if not mask.any():
+                        continue
+                    ys, xs = np.where(_largest_cc(mask))
+                    x0, y0 = max(int(xs.min()), 0), max(int(ys.min()), 0)
+                    x1 = min(int(xs.max()), img.width - 1)
+                    y1 = min(int(ys.max()), img.height - 1)
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    c = id_color[gid]
+                    dr.rectangle([x0, y0, x1, y1], outline=c, width=1)
+                    dr.text((x0 + 2, max(y0 - 17, 0)), id_label[gid], fill=c, font=font)
+                    id_frames[gid].append(fi)
+                    id_boxes[gid].append({"frame": int(fi), "box": [x0, y0, x1, y1]})
+            fp = out_dir / f"frame-{fi:02d}.png"
+            img.save(fp)
+            annotated_by_cat[cat].append(str(fp))
+
+    instances = [{
+        "label": id_label[oid],
+        "category": id_cat[oid],
+        "id": int(oid),
+        "color": id_cname[oid],
+        "frames": sorted(set(id_frames[oid])),
+        "boxes_2d": id_boxes[oid],          # [{"frame": i, "box": [x0,y0,x1,y1]}, ...]
+        "bbox_size_m": [round(float(v), 3) for v in result["merged_bbox_size"][oid]],
+        "center_3d_m": [round(float(v), 3) for v in result["merged_positions"][oid]],
+        "score": round(float(result["merged_scores"][oid]), 3),
+    } for oid in ids]
+
+    instances_by_cat = {
+        cat: [it for it in instances if it["category"] == cat]
+        for cat in categories
+    }
+    for cat in categories:
+        cat_dir = Path(dir_by_cat[cat])
+        cat_instances = instances_by_cat[cat]
+        (cat_dir / "instances.json").write_text(
+            json.dumps({"object_name": cat, "n_instances": len(cat_instances),
+                        "instances": cat_instances}, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+
+    compat_cat = str(object_name) if str(object_name) in annotated_by_cat else categories[0]
+    return {
+        "annotated_frames": annotated_by_cat.get(compat_cat, []),
+        "instances": instances,
+        "dir": dir_by_cat.get(compat_cat, ""),
+        "annotated_frames_by_category": annotated_by_cat,
+        "instances_by_category": instances_by_cat,
+        "annotated_dir_by_category": dir_by_cat,
+    }
+
+
+def draw_final_localization_annotations(
+    results_3d: dict,
+    frame_paths: Sequence[str],
+    final_locs: dict[str, dict],
+    output_dir: str | Path,
+) -> dict:
+    """Draw the Checker-validated final target localization on one 32-frame set.
+
+    Unlike ``draw_instance_annotations`` this is NOT category-separated and does
+    not show every candidate. It overlays only the final selected instance for
+    each target object, and only on the Checker-approved ``keep_frames``.
+    """
+    from PIL import Image as _Img, ImageDraw, ImageFont
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for stale in output_dir.glob("frame-*.png"):
+        stale.unlink()
+
+    try:
+        import matplotlib
+        font = ImageFont.truetype(
+            str(Path(matplotlib.get_data_path()) / "fonts/ttf/DejaVuSans-Bold.ttf"), 15)
+    except Exception:
+        font = ImageFont.load_default()
+
+    instances = results_3d.get("instances") or []
+    by_id = {int(it["id"]): it for it in instances if "id" in it}
+    selected: list[dict] = []
+    for idx, (name, loc) in enumerate(final_locs.items()):
+        if loc is None or loc.get("instance_id") is None:
+            continue
+        oid = int(loc["instance_id"])
+        inst = loc if loc.get("boxes_2d") is not None else by_id.get(oid)
+        if inst is None:
+            continue
+        keep = {int(f) for f in (loc.get("keep_frames") or inst.get("frames") or [])}
+        color_name, color = _PALETTE[idx % len(_PALETTE)]
+        label = str(loc.get("instance_label") or inst.get("label") or name)
+        selected.append({
+            "object": str(name),
+            "instance_id": oid,
+            "instance_label": label,
+            "color": color_name,
+            "keep_frames": sorted(keep),
+            "dropped_frames": list(loc.get("dropped_frames") or []),
+            "reason": str(loc.get("reason") or ""),
+            "center_3d_m": inst.get("center_3d_m"),
+            "bbox_size_m": inst.get("bbox_size_m"),
+            "boxes_2d": [b for b in inst.get("boxes_2d", [])
+                         if int(b.get("frame", -1)) in keep],
+            "_rgb": color,
+        })
+
+    frames_out: list[str] = []
+    for fi, path in enumerate(frame_paths):
+        img = _Img.open(path).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        for item in selected:
+            for box_item in item["boxes_2d"]:
+                if int(box_item.get("frame", -1)) != fi:
+                    continue
+                box = [int(v) for v in box_item.get("box", [])]
+                if len(box) != 4:
+                    continue
+                x0, y0, x1, y1 = box
+                c = item["_rgb"]
+                text = (
+                    item["instance_label"]
+                    if str(item["object"]) == str(item["instance_label"])
+                    else f"{item['object']}: {item['instance_label']}"
+                )
+                dr.rectangle([x0, y0, x1, y1], outline=c, width=3)
+                dr.text((x0 + 2, max(y0 - 17, 0)), text, fill=c, font=font)
+        fp = output_dir / f"frame-{fi:02d}.png"
+        img.save(fp)
+        frames_out.append(str(fp))
+
+    clean_selected = [{k: v for k, v in item.items() if k != "_rgb"} for item in selected]
+    meta = {
+        "dir": str(output_dir),
+        "annotated_frames": frames_out,
+        "n_targets": len(clean_selected),
+        "targets": clean_selected,
+    }
+    (output_dir / "final_localizations.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return meta
+
+
+def back_project_instance(
+    seg_results: list[dict],
+    depth: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    cluster_id: int,
+    frame_to_global,
+    frames: Sequence[int] | None = None,
+    bbox_percentile: float = 2.0,
+    dejitter: bool = True,
+) -> dict | None:
+    """Back-project ONE clustered instance to 3D, over all or a subset of frames.
+
+    Reusable by any task (distance / direction / size): given the per-frame
+    detections and the cluster id, recompute the instance's 3D position and
+    bounding box from scratch — optionally restricting to `frames` (e.g. the
+    frames a VLM deemed reliable). `frames=None` uses every frame the cluster
+    appears in (the default, so callers that don't filter get the natural result).
+
+    dejitter=True: each frame's points are recentered to their own centroid
+    before pooling, so cross-frame position jitter does not inflate the box
+    (pooling raw points would make the box ≈ true_size + jitter_range, which
+    pulls closest-point distances too small). The box size then reflects the
+    object's true extent; it is placed at the average of the per-frame centroids.
+    dejitter=False: plain pooled AABB over the raw points.
+
+    Returns dict(avg_pos, bbox_min, bbox_max, bbox_size, n_points, frames_used)
+    or None if no valid 3D points were produced.
+    """
+    want = None if frames is None else {int(f) for f in frames}
+    per_frame_cent, pooled_pts, used = [], [], []
+    n_frames = len(seg_results)
+
+    for fi in range(n_frames):
+        if want is not None and fi not in want:
+            continue
+        if fi >= len(frame_to_global):
+            continue
+        seg = seg_results[fi]
+        d_map, K = depth[fi], intrinsics[fi]
+        d_h, d_w = d_map.shape
+        c2w = np.linalg.inv(_as_homogeneous(extrinsics[fi]))
+        masks, boxes = seg.get("masks"), seg.get("boxes")
+        f2g_fi = frame_to_global[fi]
+        for li in range(len(seg.get("scores", []))):
+            if int(f2g_fi[li]) != int(cluster_id):
+                continue
+            mask_i = masks[li] if masks is not None else None
+            box_i = (_rescale_box(boxes[li], d_w, d_h, seg.get("image_size"))
+                     if (mask_i is None and boxes is not None) else None)
+            pts = _back_project_region(mask_i, box_i, d_map, K, c2w, d_h, d_w)
+            if pts is None or not len(pts):
+                continue
+            c = np.median(pts, axis=0)
+            per_frame_cent.append(c)
+            pooled_pts.append(pts - c if dejitter else pts)
+            used.append(fi)
+
+    if not pooled_pts:
+        return None
+
+    avg_pos = np.mean(per_frame_cent, axis=0)
+    pooled = np.concatenate(pooled_pts, axis=0)
+    lo_s, hi_s, _ = _compute_3d_bbox(pooled, bbox_percentile)
+    if dejitter:
+        bmin, bmax = avg_pos + lo_s, avg_pos + hi_s   # shape box re-placed at centroid
+    else:
+        bmin, bmax = lo_s, hi_s                        # already absolute
+    return {
+        "avg_pos": avg_pos,
+        "bbox_min": bmin,
+        "bbox_max": bmax,
+        "bbox_size": bmax - bmin,
+        "n_points": int(len(pooled)),
+        "frames_used": sorted(set(used)),
+    }

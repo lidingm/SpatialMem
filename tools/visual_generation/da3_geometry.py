@@ -11,7 +11,9 @@ SpatialMem samples. A typical flow is:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -28,6 +30,23 @@ DEFAULT_MODEL_DIR = Path(os.environ.get("DA3_MODEL_DIR", "/opt/models/DA3NESTED-
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 Movement = Literal["yaw_left", "yaw_right", "pitch_up", "pitch_down", "move_left", "move_right", "move_up", "move_down", "move_forward", "move_backward"]
+
+
+@contextlib.contextmanager
+def _quiet_da3_output():
+    """Suppress verbose DA3 library logs during batch runs."""
+    if os.environ.get("SPATIALMEM_QUIET_DA3", "1") in {"0", "false", "False"}:
+        yield
+        return
+
+    previous_disable = logging.root.manager.disable
+    logging.disable(logging.WARNING)
+    with open(os.devnull, "w") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            try:
+                yield
+            finally:
+                logging.disable(previous_disable)
 
 
 def _ensure_da3_importable(da3_repo: Path) -> None:
@@ -243,8 +262,9 @@ class DA3GeometryTool:
         from depth_anything_3.api import DepthAnything3
 
         self.device = _resolve_device(device)
-        self.model = DepthAnything3.from_pretrained(str(self.model_dir))
-        self.model = self.model.to(device=self.device)
+        with _quiet_da3_output():
+            self.model = DepthAnything3.from_pretrained(str(self.model_dir))
+            self.model = self.model.to(device=self.device)
         self.model.eval()
 
     def infer(
@@ -258,16 +278,17 @@ class DA3GeometryTool:
     ):
         """Run one DA3 forward pass. 3DGS is enabled by default for Giant."""
         frames = collect_image_paths(frame_paths)
-        return self.model.inference(
-            frames,
-            infer_gs=infer_gs,
-            process_res=process_res,
-            process_res_method=process_res_method,
-            use_ray_pose=use_ray_pose,
-            ref_view_strategy=ref_view_strategy,
-            export_dir=None,
-            export_format="mini_npz",
-        )
+        with _quiet_da3_output():
+            return self.model.inference(
+                frames,
+                infer_gs=infer_gs,
+                process_res=process_res,
+                process_res_method=process_res_method,
+                use_ray_pose=use_ray_pose,
+                ref_view_strategy=ref_view_strategy,
+                export_dir=None,
+                export_format="mini_npz",
+            )
 
     def run(
         self,
@@ -331,8 +352,8 @@ class DA3GeometryTool:
         output_dir: str | Path | None = None,
         horizontal_axes: tuple[int, int] = (0, 2),
         target_max_side_px: int = 1200,
-        use_conf: bool = False,
-        conf_percentile: float = 40.0,
+        use_conf: bool = True,
+        conf_percentile: float = 25.0,
         max_points: int | None = None,
         rotate_tall_display: bool = True,
         pad_to_square_display: bool = True,
@@ -396,6 +417,8 @@ class DA3GeometryTool:
             "cell_size": cell_size,
             "horizontal_axes": horizontal_axes,
             "raw_size_hw": (height, width),
+            "use_conf": use_conf,
+            "conf_percentile": conf_percentile,
         }
 
         if output_dir is not None:
@@ -446,7 +469,7 @@ class DA3GeometryTool:
         height, width = prediction.depth.shape[-2:] if render_hw is None else render_hw
 
         base_w2c = torch.from_numpy(prediction.extrinsics[frame_index : frame_index + 1]).float().to(device)
-        base_w2c = as_homogeneous(base_w2c)[0]
+        base_w2c = as_homogeneous(base_w2c)[0].float()
         base_c2w = torch.linalg.inv(base_w2c)
 
         base_intr = torch.from_numpy(prediction.intrinsics[frame_index : frame_index + 1]).float().to(device)
@@ -454,7 +477,7 @@ class DA3GeometryTool:
         intr_norm[:, 0, :] /= prediction.depth.shape[-1]
         intr_norm[:, 1, :] /= prediction.depth.shape[-2]
 
-        target_c2w = self._apply_camera_movement(base_c2w, movement, angle_deg, distance)
+        target_c2w = self._apply_camera_movement(base_c2w, movement, angle_deg, distance).float()
         target_w2c = torch.linalg.inv(target_c2w).unsqueeze(0)
 
         with torch.inference_mode():
@@ -544,9 +567,9 @@ class DA3GeometryTool:
         elif movement == "yaw_right":
             target = target @ rot_y(1.0)
         elif movement == "pitch_up":
-            target = target @ rot_x(-1.0)
-        elif movement == "pitch_down":
             target = target @ rot_x(1.0)
+        elif movement == "pitch_down":
+            target = target @ rot_x(-1.0)
         elif movement in {"move_left", "move_right", "move_up", "move_down", "move_forward", "move_backward"}:
             axis = {
                 "move_left": (0, -1.0),

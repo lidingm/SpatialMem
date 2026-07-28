@@ -1,7 +1,7 @@
 """Planner role for SpatialMem.
 
 The Planner sees:
-  - the spatial question and (a few sampled) input frames
+  - the spatial question and all prepared input frames
   - retrieved SKILL briefs for the sample's task category
   - the memory context (declarative priors)
   - the tool descriptions (fallback path)
@@ -72,8 +72,8 @@ Output JSON:
             "step": 1,
             "tool": "object_segmentation",
             "params": {{
-                "text_prompt": "<detailed description for SAM — be as specific as needed to find the right instance>",
-                "object_category": "<canonical category from Object Categories list — must be 1-3 words, no visual descriptors>"
+                "text_prompt": "<the short plain object noun from the question — SAM3 only segments short terms well, so use the question's own word (1-2 words)>",
+                "object_category": "<same short noun — 1-3 words>"
             }},
             "expected_evidence": "..."
         }},
@@ -102,6 +102,12 @@ Category assignment rules:
   - This key is used to store and retrieve size priors — consistency across samples matters.
 - For non-segmentation tools (depth_estimation, distance_computation, etc.), no object_category is needed.
 
+Raw-tool parameter rules:
+- For distance_computation, direction_computation, and object_size_computation, prefer object-name parameters from the question, such as `obj_a`, `obj_b`, `object_name`, `viewpoint_target`, `reference_target`, `target_target`, and `facing_target`. The tool layer will call Checker and resolve the final instance.
+- Never invent placeholder IDs like "<id_of_chair>" or "chair_instance_id". Use integer IDs only when a previous context explicitly contains an unambiguous concrete ID.
+- For direction questions, if the question says "standing by X" or "from X", set `viewpoint_type="object"` and `viewpoint_target="X"`. If it says "facing Y", set `facing_target="Y"`.
+- For object_segmentation, SAM3 tracks instances across video frames; use short plain object nouns so those tracks are stable.
+
 === Object Categories ===
 {OBJECT_CATEGORY_LIST}
 
@@ -111,7 +117,7 @@ Category assignment rules:
 
 
 def planner_user_message(question: str, image_paths: list[str],
-                         max_preview_images: int = 3) -> list[dict]:
+                         max_preview_images: int = 32) -> list[dict]:
     content: list[dict] = []
     header = f"Question: {question}\n\nInput: {len(image_paths)} frame(s)"
     if len(image_paths) > 1:
@@ -122,6 +128,7 @@ def planner_user_message(question: str, image_paths: list[str],
 
     for idx in _select_preview_indices(len(image_paths), max_preview_images):
         try:
+            content.append({"type": "text", "text": f"Input frame {idx}:"})
             b64 = _encode_image_base64(image_paths[idx])
             suffix = Path(image_paths[idx]).suffix.lower()
             mime = "image/png" if suffix == ".png" else "image/jpeg"
@@ -138,10 +145,11 @@ class Planner:
 
     def plan(self, sample, memory_context: str,
              retrieved_skills, tool_descriptions: str,
-             max_preview_images: int = 3) -> dict:
+             max_preview_images: int = 32,
+             image_paths: list[str] | None = None) -> dict:
         skills_brief = "\n\n".join(s.brief() for s in retrieved_skills)
         sys_prompt = planner_system_prompt(tool_descriptions, skills_brief, memory_context)
-        user_content = planner_user_message(sample.question, sample.image_paths,
+        user_content = planner_user_message(sample.question, image_paths or sample.image_paths,
                                             max_preview_images=max_preview_images)
         messages = [
             {"role": "system", "content": sys_prompt},

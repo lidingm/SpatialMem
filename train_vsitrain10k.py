@@ -14,9 +14,9 @@ Features
 
 Usage
 -----
-  python train_vsitrain10k.py                         # all types, all samples
+  python train_vsitrain10k.py                         # all types, 300 samples per type
   python train_vsitrain10k.py --types object_count    # single type
-  python train_vsitrain10k.py --max_per_type 200      # quick test
+  python train_vsitrain10k.py --max_per_type 50       # quick test
   python train_vsitrain10k.py --no_evolve             # eval only, no evolution
   python train_vsitrain10k.py --device cuda:1         # pick GPU
 """
@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -43,17 +44,33 @@ os.environ.setdefault("DA3_MODEL_DIR", "/home/zhouruofan/Training-Free/tool_mode
 os.environ.setdefault("DA3_REPO",      "/home/zhouruofan/Training-Free/tool_model/depth-anything-3")
 os.environ.setdefault("DA3_LOG_LEVEL", "WARN")  # suppress DA3 INFO timing logs
 
-RESULTS_SUBDIR = "train_vsitrain10k"
+RESULTS_SUBDIR = "train_vsitrain10k_v2"
 PROMOTE_EVERY  = 50   # promote eligible pending SKILLs every N samples
-PRINT_EVERY    = 10   # print running accuracy every N samples
+PRINT_EVERY    = 10   # print running score every N samples
+
+
+class Tee:
+    """Mirror stdout/stderr to a log file while keeping terminal output."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--types", nargs="*", default=None,
                    help="Question types to run (default: all 7)")
-    p.add_argument("--max_per_type", type=int, default=None,
-                   help="Max samples per question type (default: all)")
+    p.add_argument("--max_per_type", type=int, default=300,
+                   help="Max samples per question type (default: 300)")
     p.add_argument("--shuffle", action="store_true", default=True)
     p.add_argument("--no_shuffle", dest="shuffle", action="store_false")
     p.add_argument("--seed", type=int, default=42)
@@ -62,25 +79,32 @@ def parse_args():
                    help="Disable evolution (eval-only mode)")
     p.add_argument("--verbose", action="store_true", default=False,
                    help="Print per-step agent output")
-    p.add_argument("--ckpt", default="init_v1",
-                   help="Checkpoint name under ckpts/ to read/write skills and memory (default: init_v1)")
+    p.add_argument("--ckpt", default="v2",
+                   help="Checkpoint name under ckpts/ to read/write skills and memory (default: v2)")
+    p.add_argument("--results_subdir", default=RESULTS_SUBDIR,
+                   help=f"Subdirectory under results/ for jsonl and logs (default: {RESULTS_SUBDIR})")
+    p.add_argument("--log_name", default="run.log",
+                   help="Log filename under the results subdirectory (default: run.log)")
     return p.parse_args()
 
 
-def load_done_ids(results_file: Path) -> set[str]:
-    """Read sample IDs already written to a results file (for resume)."""
-    done = set()
+def load_done_entries(results_file: Path) -> dict[str, dict]:
+    """Read completed sample entries already written to a results file."""
+    done = {}
     if results_file.exists():
         with results_file.open(encoding="utf-8") as f:
             for line in f:
                 try:
-                    done.add(json.loads(line)["sample_id"])
+                    entry = json.loads(line)
+                    done[entry["sample_id"]] = entry
                 except Exception:
                     pass
     return done
 
 
 def append_result(f, result, sample) -> None:
+    score = score_sample(result.predicted_answer, result.gt_answer,
+                         result.answer_format, getattr(sample, "raw", {}).get("options"))
     entry = {
         "sample_id":        result.sample_id,
         "task_type":        result.task_type,
@@ -90,6 +114,8 @@ def append_result(f, result, sample) -> None:
         "gt_answer":        result.gt_answer,
         "predicted_answer": result.predicted_answer,
         "success":          result.success,
+        "score":            score,
+        "metric":           "MRA" if result.answer_format != "select" else "ACC",
         "confidence":       result.confidence,
         "num_rounds":       result.num_rounds,
         "duration_seconds": round(result.duration_seconds, 2),
@@ -102,11 +128,57 @@ def append_result(f, result, sample) -> None:
     f.flush()
 
 
-def print_summary(qt: str, correct: int, total: int, t_elapsed: float):
-    acc = correct / total if total else 0
+def print_summary(qt: str, score_sum: float, total: int, metric: str,
+                  t_elapsed: float, ok_count: int):
+    avg_score = score_sum / total if total else 0
     print(f"\n{'─'*50}")
-    print(f"[{qt}] {correct}/{total} = {acc:.1%}  |  {t_elapsed/max(total,1):.1f}s/sample")
+    print(f"[{qt}] avg {metric}={avg_score:.3f}  |  OK={ok_count}/{total}  "
+          f"|  {t_elapsed/max(total,1):.1f}s/sample")
     print(f"{'─'*50}")
+
+
+def _extract_number(text: str) -> float | None:
+    m = re.search(r"[-+]?\d*\.?\d+", str(text))
+    return float(m.group()) if m else None
+
+
+def _extract_option(text: str) -> str | None:
+    m = re.search(r"\b([A-D])\b", str(text).upper())
+    return m.group(1) if m else None
+
+
+def mean_relative_accuracy(pred: str, gt: str) -> float:
+    """VSI-style MRA over thresholds 0.5, 0.55, ..., 0.95."""
+    p = _extract_number(pred)
+    g = _extract_number(gt)
+    if p is None or g is None:
+        return 0.0
+    if abs(g) < 1e-9:
+        return 1.0 if abs(p - g) < 0.5 else 0.0
+    rel_err = abs(p - g) / abs(g)
+    thresholds = [0.5 + 0.05 * i for i in range(10)]
+    return sum(1.0 for t in thresholds if rel_err < (1.0 - t)) / len(thresholds)
+
+
+def mc_accuracy(pred: str, gt: str, options: list[str] | None = None) -> float:
+    g = _extract_option(gt) or str(gt).strip().upper()
+    p = _extract_option(pred)
+    if p is None and options:
+        pl = str(pred).strip().lower()
+        for opt in options:
+            head, _, body = str(opt).partition(".")
+            body = body.strip().lower()
+            if body and (pl == body or body in pl):
+                p = head.strip().upper()
+                break
+    return 1.0 if (p is not None and p == g) else 0.0
+
+
+def score_sample(pred: str, gt: str, answer_format: str,
+                 options: list[str] | None = None) -> float:
+    if answer_format == "select":
+        return mc_accuracy(pred, gt, options)
+    return mean_relative_accuracy(pred, gt)
 
 
 def main():
@@ -131,8 +203,16 @@ def main():
 
     ensure_dirs()
 
-    results_dir = PROJECT_ROOT / "results" / RESULTS_SUBDIR
+    results_dir = PROJECT_ROOT / "results" / args.results_subdir
     results_dir.mkdir(parents=True, exist_ok=True)
+    log_path = results_dir / args.log_name
+    log_f = log_path.open("a", encoding="utf-8")
+    sys.stdout = Tee(sys.stdout, log_f)
+    sys.stderr = Tee(sys.stderr, log_f)
+    print(f"\n{'='*60}")
+    print(f"Run log: {log_path}")
+    print(f"LLM model: {os.environ['LLM_MODEL']}")
+    print(f"{'='*60}\n")
 
     # ── Model init ────────────────────────────────────────────────────
     print(f"Initialising models on {args.device} ...")
@@ -156,7 +236,7 @@ def main():
         base_url=os.environ["LLM_BASE_URL"],
         api_key=os.environ["LLM_API_KEY"],
         model=os.environ["LLM_MODEL"],
-        temperature=0.7,
+        temperature=1.0,
     )
 
     # ── Checkpoint ────────────────────────────────────────────────────
@@ -171,7 +251,7 @@ def main():
     loader    = VSITrain10KDataLoader()
     memory    = Memory(root=memory_root)
     skill_lib = SkillLib(root=skills_root, pending_dir=skills_root / "pending")
-    tools     = ToolRegistry(da3_tool=da3_tool, sam3_tool=sam3_tool)
+    tools     = ToolRegistry(da3_tool=da3_tool, sam3_tool=sam3_tool, llm=llm, memory=memory)
     planner   = Planner(llm)
     reasoner  = Reasoner(llm)
     reflector = Reflector(llm)
@@ -194,7 +274,8 @@ def main():
     print(f"Results dir: {results_dir}\n")
 
     # ── Global counters ───────────────────────────────────────────────
-    g_total = g_correct = 0
+    g_total = g_ok = 0
+    g_score_sum = 0.0
     g_start = time.time()
 
     for qt in run_types:
@@ -206,7 +287,8 @@ def main():
         )
 
         results_file = results_dir / f"{qt}.jsonl"
-        done_ids     = load_done_ids(results_file)
+        done_entries = load_done_entries(results_file)
+        done_ids     = set(done_entries)
         remaining    = [s for s in samples if s.id not in done_ids]
 
         print(f"\n{'='*60}")
@@ -214,25 +296,37 @@ def main():
               f"remaining={len(remaining)}")
         print(f"{'='*60}")
 
-        if not remaining:
-            print("  All done — skipping.")
-            continue
-
-        qt_correct = qt_total = 0
+        qt_total = qt_ok = 0
+        qt_score_sum = 0.0
+        qt_metric = "score"
         qt_start   = time.time()
 
-        # Count previously done results toward the summary
-        for prev in done_ids:
-            qt_total += 1  # we don't re-read success status, just track count
+        # Count previously done results toward resumed summaries.
+        for prev in done_entries.values():
+            if "score" not in prev:
+                continue
+            qt_total += 1
+            g_total += 1
+            score = float(prev.get("score") or 0.0)
+            qt_score_sum += score
+            g_score_sum += score
+            if prev.get("success"):
+                qt_ok += 1
+                g_ok += 1
+            qt_metric = prev.get("metric") or qt_metric
+
+        if not remaining:
+            print("  All done — using saved results for summary.")
+            print_summary(qt, qt_score_sum, qt_total, qt_metric,
+                          time.time() - qt_start, qt_ok)
+            continue
 
         with results_file.open("a", encoding="utf-8") as out_f:
             try:
                 for i, sample in enumerate(remaining):
                     idx = len(done_ids) + i + 1
-                    print(f"\n{'#'*55}")
-                    print(f"# [{qt}] {idx}/{len(samples)}  id={sample.id}")
-                    print(f"# Q: {sample.question[:120]}")
-                    print(f"{'#'*55}")
+                    print(f"\n[SAMPLE] {qt} {idx}/{len(samples)} id={sample.id}")
+                    print(f"Q: {sample.question[:220]}")
 
                     try:
                         result = orch.run(sample)
@@ -246,24 +340,37 @@ def main():
                         continue
 
                     # Log skill selection / raw-tool plan
-                    if result.chosen_skill:
-                        skill_params = result.plan.get("skill_params") or {}
-                        print(f"[PLAN] SKILL={result.chosen_skill}  params={skill_params}")
-                    else:
-                        steps = result.plan.get("plan", [])
-                        plan_str = " -> ".join(s.get("tool", "?") for s in steps)
-                        print(f"[PLAN] raw-tool: {plan_str or '(empty)'}")
+                    if args.verbose:
+                        if result.chosen_skill:
+                            skill_params = result.plan.get("skill_params") or {}
+                            print(f"[PLAN] SKILL={result.chosen_skill}  params={skill_params}")
+                        else:
+                            steps = result.plan.get("plan", [])
+                            plan_str = " -> ".join(s.get("tool", "?") for s in steps)
+                            print(f"[PLAN] raw-tool: {plan_str or '(empty)'}")
 
-                    status = "✓ CORRECT" if result.success else "✗ WRONG"
-                    print(f">>> {status} | pred={result.predicted_answer!r}  "
-                          f"gt={result.gt_answer!r}  time={result.duration_seconds:.1f}s")
+                    print("[SUMMARY]")
+                    print(result.final_context.strip() or "(empty)")
+
+                    score = score_sample(
+                        result.predicted_answer, result.gt_answer,
+                        result.answer_format, getattr(sample, "raw", {}).get("options"),
+                    )
+                    metric = "MRA" if result.answer_format != "select" else "ACC"
+                    status = "OK" if result.success else "WRONG"
+                    print(f"[RESULT] {status} {metric}={score:.3f} "
+                          f"gt={result.gt_answer!r} pred={result.predicted_answer!r} "
+                          f"time={result.duration_seconds:.1f}s skill={result.chosen_skill or 'none'}")
 
                     append_result(out_f, result, sample)
                     qt_total   += 1
                     g_total    += 1
+                    qt_score_sum += score
+                    g_score_sum  += score
+                    qt_metric = metric
                     if result.success:
-                        qt_correct += 1
-                        g_correct  += 1
+                        qt_ok += 1
+                        g_ok  += 1
 
                     # Evolution
                     if evolve:
@@ -282,7 +389,8 @@ def main():
                                 parts.append(f"NEW_SKILL={update['pending_saved']}")
                             if update.get("bootstrapped"):
                                 parts.append(f"BOOTSTRAPPED={update['bootstrapped']}")
-                            print(f"[EVOLVE] {'  '.join(parts)}")
+                            if args.verbose:
+                                print(f"[EVOLVE] {'  '.join(parts)}")
                         except Exception:
                             traceback.print_exc()
                             print("[EVOLVE] evolution step failed, continuing.")
@@ -296,8 +404,9 @@ def main():
                     # Running accuracy print
                     if (i + 1) % PRINT_EVERY == 0:
                         elapsed = time.time() - qt_start
-                        acc = qt_correct / qt_total if qt_total else 0
-                        print(f"\n  ↳ [{qt}] running acc={qt_correct}/{qt_total}={acc:.1%}  "
+                        avg_score = qt_score_sum / qt_total if qt_total else 0
+                        print(f"\n  ↳ [{qt}] running {qt_metric}={avg_score:.3f}  "
+                              f"OK={qt_ok}/{qt_total}  "
                               f"elapsed={elapsed:.0f}s  "
                               f"~{elapsed/(i+1):.1f}s/sample\n")
 
@@ -310,14 +419,16 @@ def main():
             if promoted:
                 print(f"[PROMOTE final] {promoted}")
 
-        print_summary(qt, qt_correct, qt_total, time.time() - qt_start)
+        print_summary(qt, qt_score_sum, qt_total, qt_metric,
+                      time.time() - qt_start, qt_ok)
 
     # ── Global summary ────────────────────────────────────────────────
     elapsed = time.time() - g_start
     print(f"\n{'='*60}")
     print(f"ALL DONE")
-    print(f"  Global accuracy : {g_correct}/{g_total} = "
-          f"{g_correct/max(g_total,1):.1%}")
+    print(f"  Global avg score: {g_score_sum/max(g_total,1):.3f}")
+    print(f"  Global OK rate  : {g_ok}/{g_total} = "
+          f"{g_ok/max(g_total,1):.1%}")
     print(f"  Total time      : {elapsed/3600:.1f}h  "
           f"({elapsed/max(g_total,1):.1f}s/sample)")
     print(f"  Results dir     : {results_dir}")

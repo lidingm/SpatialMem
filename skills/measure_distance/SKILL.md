@@ -23,20 +23,18 @@ Use this skill for queries requesting the distance between two distinct, standar
 # Tool Sequence
 
 1. `depth_estimation` — recover metric depth + camera poses for all frames.
-2. `object_segmentation` × N — one call per target in `targets`; produces per-frame 2D masks.
+2. `object_segmentation` × N — one call per target in `targets`; SAM3 tracks candidate instances across frames and returns masks, boxes, scores, and track IDs.
 3. `instance_3d_localization` — back-project masks into 3D, cluster across frames.
-4. `distance_computation` — Euclidean distance in the appropriate mode.
+4. `distance_computation` — Checker selects the intended track/frames for each target, then the tool computes Euclidean distance in the appropriate mode. Prefer passing object names from `targets`; do not invent placeholder instance IDs.
 
 # Known Pitfalls
 
-- **[Generic/functional object terms]** Object segmentation fails on abstract names (e.g., 'heater') → use common visual synonyms (e.g., 'radiator').
-- **[Overly specific segmentation prompts]** Compound nouns like "ceiling light" yield zero detections → simplify to core category labels (e.g., 'light').
-- **[Broad semantic prompts]** Generic names capture background clutter → add spatial context (e.g., 'on ceiling', 'on floor') to isolate the target instance.
-- **[Large planar targets]** Flat/featureless objects (rugs, floor markings) are dropped during 3D back-projection → validate that the target appears in instance output; if missing, skip this skill.
-- **[Multiple instances of same class]** When several instances of the target object exist, the skill picks the first found; this may not be the closest one → check if multiple instances are present and run distance_computation for each, then pick the minimum.
-- **[Missing target in 3D clustering]** When 3D localization fails to detect or correctly label one target object (e.g., bucket merged into trash can), the model guesses the distance → explicitly compute pairwise distances between all high-confidence instances and validate against 2D segmentation masks
-- **[Multiple instances of target object]** System defaults to the first or highest-score detection instead of the contextually intended one → filter instances by spatial proximity or explicit query cues before metric computation
+None yet.
 
 # Examples
+
+None yet.
+
+# Checker
 
 None yet.

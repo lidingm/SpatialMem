@@ -33,6 +33,10 @@ VSI_IMAGES_ROOT = Path(os.getenv(
     "VSI_IMAGES_ROOT",
     "/home/zhouruofan/datasets/VSI-Bench/images",
 ))
+VSI_TEST_JSONL = Path(os.getenv(
+    "VSI_TEST_JSONL",
+    "/home/zhouruofan/datasets/VSI-Bench/test.jsonl",
+))
 
 # ─── Dataset (VSI-Train-10k) ──────────────────────────────────────────
 

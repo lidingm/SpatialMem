@@ -19,7 +19,8 @@ Usage
   python eval_vsibench.py                              # all types except route_planning
   python eval_vsibench.py --types object_counting      # single type
   python eval_vsibench.py --max_per_type 50            # quick smoke test
-  python eval_vsibench.py --device cuda:0 --ckpt init_v1
+  python eval_vsibench.py --device cuda:0 --ckpt base
+  python eval_vsibench.py --ckpt base --types object_counting --llm_base_url http://127.0.0.1:8000/v1 --llm_model Qwen3-VL-8B-Instruct
 """
 
 from __future__ import annotations
@@ -59,12 +60,12 @@ os.environ.setdefault("DA3_MODEL_DIR", "/home/zhouruofan/Training-Free/tool_mode
 os.environ.setdefault("DA3_REPO",      "/home/zhouruofan/Training-Free/tool_model/depth-anything-3")
 os.environ.setdefault("DA3_LOG_LEVEL", "WARN")
 
-DEFAULT_TEST_JSONL = "/home/zhouruofan/datasets/VSI-Bench/test.jsonl"
 RESULTS_SUBDIR = "eval_vsibench"
 PRINT_EVERY = 10
 
 # route_planning (and its corrupted variant) are excluded by default.
 EXCLUDE_TYPES = {"route_planning", "e_planniroutng"}
+ROUTE_PLANNING_TYPES = {"route_planning", "e_planniroutng"}
 
 
 # ─── Official VSI-Bench scoring ──────────────────────────────────────────
@@ -165,6 +166,103 @@ def load_test_samples(jsonl_path: str, images_root: Path):
     return samples
 
 
+# ─── Pipeline intermediates ─────────────────────────────────────────────
+
+def collect_stages(tools) -> dict:
+    """Pull the pipeline's intermediate numbers out of the tool context.
+
+    The agent's own prints are silenced during the run, so read the state
+    directly afterwards. Recording base_count vs adjusted_count is what makes
+    the VLM calibration's effect measurable WITHIN a single run — comparing two
+    runs conflates it with any other code change.
+    """
+    st: dict = {}
+    try:
+        ctx = tools.context
+        seg = ctx.get("all_seg_results") or {}
+        if seg:
+            st["n_tracks"] = {p: len({int(o) for s in segs for o in (s.get("obj_ids") or [])})
+                              for p, segs in seg.items()}
+        appearance = ctx.get("appearance_order_result") or {}
+        if appearance:
+            per_object = appearance.get("per_object") or {}
+            st["appearance_first_frames"] = {
+                k: (None if (not v.get("found") or v.get("first_frame") == float("inf")) else int(v.get("first_frame")))
+                for k, v in per_object.items()
+            }
+            st["appearance_found"] = {k: bool(v.get("found")) for k, v in per_object.items()}
+            st["appearance_semantic_order"] = list(appearance.get("semantic_order") or [])
+        r3d = ctx.get("results_3d")
+        if r3d is not None:
+            st["n_clusters_3d"] = len(r3d.get("obj_id_list", []))
+            # per-category breakdown (distance/direction cluster 2 objects together)
+            insts = r3d.get("instances")
+            if insts:
+                by_cat = {}
+                for it in insts:
+                    by_cat[it.get("category", "?")] = by_cat.get(it.get("category", "?"), 0) + 1
+                if len(by_cat) > 1:
+                    st["n_clusters_by_cat"] = by_cat
+        cnt = ctx.get("counting")
+        if cnt is not None:
+            st["count_final"] = cnt.get("total_unique")
+            cal = cnt.get("calibration")
+            if cal and cal.get("error") is None:
+                st["calib_base"] = cal.get("base_count")
+                st["calib_adjusted"] = cal.get("adjusted_count")
+                st["calib_applied"] = cal.get("applied", [])
+                raw = cal.get("raw") or {}
+                st["calib_raw_response"] = raw.get("_raw_response", raw)
+            elif cal:
+                st["calib_error"] = cal.get("error")
+        # distance/direction: what the VLM picked + the measured distance
+        dl = ctx.get("distance_localization")
+        if dl:
+            st["vlm_pick"] = {n: ([l["instance_label"], l["keep_frames"], l.get("reason", "")]
+                                  if l else None) for n, l in dl.items()}
+        dist = ctx.get("distance")
+        if dist is not None:
+            st["distance_m"] = round(float(dist["meters"]), 3)
+            st["distance_pair"] = f"{dist['a']}<->{dist['b']}"
+    except Exception:
+        pass
+    return st
+
+
+def print_stages(st: dict) -> None:
+    if not st:
+        return
+    bits = []
+    if "n_tracks" in st:
+        bits.append("tracks=" + ",".join(f"{k}:{v}" for k, v in st["n_tracks"].items()))
+    if "n_clusters_by_cat" in st:
+        bits.append("3D_clusters=" + ",".join(f"{k}:{v}" for k, v in st["n_clusters_by_cat"].items()))
+    elif "n_clusters_3d" in st:
+        bits.append(f"3D_clusters={st['n_clusters_3d']}")
+    if "calib_base" in st:
+        bits.append(f"calib={st['calib_base']}->{st['calib_adjusted']}")
+    elif "calib_error" in st:
+        bits.append(f"calib_ERR={st['calib_error']}")
+    if "count_final" in st:
+        bits.append(f"count={st['count_final']}")
+    if "distance_m" in st:
+        bits.append(f"dist={st['distance_m']}m ({st.get('distance_pair','')})")
+    if bits:
+        print(f"    stages: {'  |  '.join(bits)}")
+    for a in st.get("calib_applied", []):
+        print(f"      - {a}")
+    if "calib_raw_response" in st:
+        print(f"[CHECKER RAW] count calibration:\n{st['calib_raw_response']}")
+    elif "calib_error" in st:
+        print(f"[CHECKER RAW] count calibration ERROR: {st['calib_error']}")
+    for n, v in (st.get("vlm_pick") or {}).items():
+        if v is None:
+            print(f"      VLM {n}: no candidate")
+        else:
+            lbl, keep, reason = v
+            print(f"      VLM {n}: {lbl}  frames={keep}" + (f"  — {reason}" if reason else ""))
+
+
 def load_done(results_file: Path) -> dict[str, float]:
     """Map already-scored sample_id -> score (for resume + aggregation)."""
     done = {}
@@ -179,14 +277,36 @@ def load_done(results_file: Path) -> dict[str, float]:
     return done
 
 
+def load_excluded_ids(path_str: str | None) -> set[str]:
+    ids: set[str] = set()
+    if not path_str:
+        return ids
+    path = Path(path_str)
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            sample_id = line.strip()
+            if sample_id:
+                ids.add(sample_id)
+    return ids
+
+
+def load_route_split(path_str: str | None) -> dict | None:
+    if not path_str:
+        return None
+    path = Path(path_str)
+    import json
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def parse_args():
+    from agent.config import VSI_TEST_JSONL
     p = argparse.ArgumentParser()
-    p.add_argument("--test_jsonl", default=DEFAULT_TEST_JSONL)
+    p.add_argument("--test_jsonl", default=str(VSI_TEST_JSONL))
     p.add_argument("--types", nargs="*", default=None,
                    help="Question types to eval (default: all in the file except route_planning)")
     p.add_argument("--max_per_type", type=int, default=None)
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--ckpt", default="init_v1",
+    p.add_argument("--ckpt", default="base",
                    help="Checkpoint under ckpts/ for skills+memory (read-only). "
                         "Pass 'base' to use the project's base skills/memory.")
     p.add_argument("--out", default=RESULTS_SUBDIR,
@@ -196,6 +316,20 @@ def parse_args():
                    help="Tool artifact dir (DA3/SAM3 intermediate files). Defaults "
                         "to outputs/eval_<device> so parallel workers don't clobber "
                         "each other's files.")
+    p.add_argument("--llm_base_url", default=os.environ.get("LLM_BASE_URL"),
+                   help="OpenAI-compatible LLM/VLM base URL, e.g. http://127.0.0.1:8000/v1")
+    p.add_argument("--llm_model", default=os.environ.get("LLM_MODEL"),
+                   help="Model id served by /v1/models")
+    p.add_argument("--llm_api_key", default=os.environ.get("LLM_API_KEY", "EMPTY"),
+                   help="API key for OpenAI-compatible endpoint; local servers often accept EMPTY")
+    p.add_argument("--include_route_planning", action="store_true", default=False,
+                   help="Allow route_planning evaluation. By default it is still skipped.")
+    p.add_argument("--exclude_ids_file", default=None,
+                   help="Optional newline-separated sample-id file to exclude before evaluation.")
+    p.add_argument("--route_split_json", default=None,
+                   help="Optional route_planning split json written by train_route_planning94.py.")
+    p.add_argument("--route_partition", choices=["holdout", "train", "all"], default="holdout",
+                   help="When --route_split_json is provided, evaluate the holdout or train partition. Default: holdout.")
     p.add_argument("--verbose", action="store_true", default=False)
     return p.parse_args()
 
@@ -237,9 +371,13 @@ def main():
             sam3_repo=os.environ["SAM3_REPO"], checkpoint_path=os.environ["SAM3_CHECKPOINT"],
             device=args.device, confidence_threshold=0.3)
     print("Models ready.")
+    llm_base_url = args.llm_base_url or os.environ["LLM_BASE_URL"]
+    llm_model = args.llm_model or os.environ["LLM_MODEL"]
+    llm_api_key = args.llm_api_key or os.environ.get("LLM_API_KEY", "EMPTY")
+    print(f"LLM endpoint: {llm_base_url} | model: {llm_model}")
     llm = LLMClient(
-        base_url=os.environ["LLM_BASE_URL"], api_key=os.environ["LLM_API_KEY"],
-        model=os.environ["LLM_MODEL"], temperature=0.7)
+        base_url=llm_base_url, api_key=llm_api_key,
+        model=llm_model, temperature=0.7)
 
     # Skills + memory (read-only; no evolution).
     if args.ckpt == "base":
@@ -262,7 +400,7 @@ def main():
     tool_out_root = Path(args.out_root) if args.out_root else \
         Path(OUTPUTS_DIR) / f"eval_{args.device.replace(':', '')}"
     tools     = ToolRegistry(da3_tool=da3_tool, sam3_tool=sam3_tool,
-                             output_root=tool_out_root)
+                             output_root=tool_out_root, llm=llm, memory=memory)
     print(f"Tool artifacts: {tool_out_root}")
     orch      = Orchestrator(tools, memory, skill_lib,
                              Planner(llm), Reasoner(llm), Reflector(llm),
@@ -270,13 +408,35 @@ def main():
 
     # ── Load data ─────────────────────────────────────────────────────
     by_type = load_test_samples(args.test_jsonl, Path(VSI_IMAGES_ROOT))
-    available = [qt for qt in by_type if qt not in EXCLUDE_TYPES]
+    route_split = load_route_split(args.route_split_json)
+    excluded_ids = load_excluded_ids(args.exclude_ids_file)
+    effective_exclude_types = set(EXCLUDE_TYPES)
+    if args.include_route_planning or route_split is not None:
+        effective_exclude_types -= ROUTE_PLANNING_TYPES
+
+    available = [qt for qt in by_type if qt not in effective_exclude_types]
     run_types = args.types if args.types else sorted(available)
-    run_types = [qt for qt in run_types if qt not in EXCLUDE_TYPES]
+    run_types = [qt for qt in run_types if qt not in effective_exclude_types]
+
+    if route_split is not None:
+        if args.route_partition == "train":
+            selected_ids = set(route_split.get("train_ids", []))
+        elif args.route_partition == "holdout":
+            selected_ids = set(route_split.get("holdout_ids", []))
+        else:
+            selected_ids = set(route_split.get("train_ids", [])) | set(route_split.get("holdout_ids", []))
+        if not selected_ids:
+            raise SystemExit(f"[ERROR] no ids found for route partition: {args.route_partition}")
+    else:
+        selected_ids = set()
 
     print(f"\nTest file : {args.test_jsonl}")
     print(f"Types     : {run_types}")
-    print(f"Excluded  : {sorted(EXCLUDE_TYPES)}")
+    print(f"Excluded  : {sorted(effective_exclude_types)}")
+    if args.exclude_ids_file:
+        print(f"Exclude IDs: {args.exclude_ids_file}  (n={len(excluded_ids)})")
+    if route_split is not None:
+        print(f"Route split: {args.route_split_json}  partition={args.route_partition}  (n={len(selected_ids)})")
     print(f"Results   : {results_dir}\n")
 
     per_type_scores: dict[str, list[float]] = {}
@@ -284,6 +444,10 @@ def main():
 
     for qt in run_types:
         samples = by_type.get(qt, [])
+        if qt in ROUTE_PLANNING_TYPES and route_split is not None:
+            samples = [s for s in samples if s.id in selected_ids]
+        if excluded_ids:
+            samples = [s for s in samples if s.id not in excluded_ids]
         if args.max_per_type is not None:
             samples = samples[:args.max_per_type]
         if not samples:
@@ -306,6 +470,7 @@ def main():
                     idx = len(done) + i + 1
                     print(f"\n# [{qt}] {idx}/{len(samples)} id={sample.id}  "
                           f"Q: {sample.question.splitlines()[0][:90]}")
+                    result = None
                     try:
                         with _silence():                   # hide SAM3/DA3 chatter
                             result = orch.run(sample)      # summarizer -> answer
@@ -313,6 +478,10 @@ def main():
                     except Exception:
                         traceback.print_exc()
                         pred = ""
+                    summary_text = ""
+                    if result is not None:
+                        summary_text = str(getattr(result, "final_context", "") or "")
+                    stages = collect_stages(tools)
                     options = sample.raw.get("options")
                     score = score_sample(pred, sample.gt_answer, sample.answer_format, options)
                     per_type_scores[qt].append(score)
@@ -326,6 +495,9 @@ def main():
                     out_f.flush()
 
                     print(f">>> {metric_name}={score:.3f}  pred={pred!r} gt={sample.gt_answer!r}")
+                    if summary_text:
+                        print(summary_text)
+                    print_stages(stages)
                     if (i + 1) % PRINT_EVERY == 0:
                         cur = per_type_scores[qt]
                         print(f"  ↳ [{qt}] running {metric_name}={sum(cur)/len(cur):.3f} "

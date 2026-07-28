@@ -1,7 +1,7 @@
 """SKILL: measure_distance.
 
 Compute the metric distance between two objects (or an object and the camera).
-Instance IDs are resolved by label from merged_labels, not hardcoded indices.
+Target names are passed to the tool layer; Checker resolves the final instances.
 """
 
 from __future__ import annotations
@@ -44,36 +44,13 @@ def execute(sample, tools, ctx, params=None):
         return {"success": False, "tool_calls": calls,
                 "summary": f"instance_3d_localization failed: {r['error']}"}
 
-    # Resolve instance IDs by label
-    r3d = ctx.get("results_3d", {})
-    merged_labels = r3d.get("merged_labels", [])
-    obj_ids = r3d.get("obj_id_list", [])
-
-    def _find_id(label: str) -> int | None:
-        for i in obj_ids:
-            if i < len(merged_labels) and merged_labels[i] == label:
-                return i
-        return None
-
     if mode == "object_to_object":
-        a_id = _find_id(targets[0])
-        b_id = _find_id(targets[1])
-        if a_id is None:
-            return {"success": False, "tool_calls": calls,
-                    "summary": f"no instance found for '{targets[0]}'; detected labels={merged_labels}"}
-        if b_id is None:
-            return {"success": False, "tool_calls": calls,
-                    "summary": f"no instance found for '{targets[1]}'; detected labels={merged_labels}"}
-        r = _call("distance_computation", {"mode": "object_to_object",
-                                           "obj_a_id": a_id, "obj_b_id": b_id})
+        p = {"mode": "object_to_object", "obj_a": targets[0], "obj_b": targets[1]}
+        r = _call("distance_computation", p)
     else:
-        obj_id = _find_id(targets[0])
-        if obj_id is None:
-            return {"success": False, "tool_calls": calls,
-                    "summary": f"no instance found for '{targets[0]}'; detected labels={merged_labels}"}
-        r = _call("distance_computation", {"mode": "object_to_camera",
-                                           "obj_id": obj_id,
-                                           "frame_index": params.get("frame_index", 0)})
+        p = {"mode": "object_to_camera", "obj": targets[0],
+             "frame_index": params.get("frame_index", 0)}
+        r = _call("distance_computation", p)
 
     return {
         "success": r["success"],

@@ -33,6 +33,7 @@ KNOWN_TOOLS = frozenset([
     "object_segmentation", "annotation_localization",
     "instance_3d_localization", "instance_counting",
     "distance_computation", "direction_computation",
+    "object_size_computation",
     "scene_size_computation",
 ])
 
@@ -95,12 +96,13 @@ class Orchestrator:
         retrieved = self.skill_lib.retrieve(sample.task_category, sample.question, top_k=3)
         if self.verbose:
             print(f"\n{'='*60}\nSample {sample.id} | type={sample.task_type} "
-                  f"(category={sample.task_category})\nQ: {sample.question[:180]}\n"
+                  f"(category={sample.task_category})\nQ: {sample.question}\n"
                   f"GT: {sample.gt_answer}\nRetrieved SKILLs: "
                   f"{[s.name for s in retrieved]}\n{'='*60}")
 
         plan = self.planner.plan(
-            sample, memory_ctx, retrieved, self.tools.tool_descriptions)
+            sample, memory_ctx, retrieved, self.tools.tool_descriptions,
+            image_paths=self.tools.context.get("frame_paths"))
         chosen_skill_name = plan.get("chosen_skill") or None
         # Cache Planner-inferred scene_type in tool context so evolve.py can
         # bucket scene_scale_prior updates under the right key (bedroom, kitchen, ...)
@@ -132,6 +134,8 @@ class Orchestrator:
                 num_rounds = self._raw_tool_loop(sample, plan)
             else:
                 params = plan.get("skill_params", {}) or {}
+                checker_notes = skill.sections.get("Checker", "").strip()
+                self.tools.set_checker_notes(checker_notes)
                 try:
                     inv = self.skill_lib.invoke(skill, sample, self.tools,
                                                 self.tools.context, params)
@@ -142,6 +146,7 @@ class Orchestrator:
                         if self.verbose:
                             print(f"[SKILL:{skill.name}] returned failure: "
                                   f"{inv.get('summary', '')}; falling back to raw-tool loop")
+                        self.tools.set_checker_notes("")
                         num_rounds = self._raw_tool_loop(sample, plan)
                     else:
                         skills_used.append(skill.name)
@@ -158,8 +163,10 @@ class Orchestrator:
                         "params": params, "success": False,
                         "result_summary": "", "error": str(e),
                     })
+                    self.tools.set_checker_notes("")
                     num_rounds = self._raw_tool_loop(sample, plan)
         else:
+            self.tools.set_checker_notes("")
             num_rounds = self._raw_tool_loop(sample, plan)
 
         ctx_summary = self.tools.get_context_summary()
@@ -177,7 +184,8 @@ class Orchestrator:
             scene_type=final_scene_type or None,
         )
         final = self.reflector.finalize(
-            sample.question, sample.answer_format, ctx_summary, final_memory_ctx)
+            sample.question, sample.answer_format, ctx_summary, final_memory_ctx,
+            visual_evidence=self.tools.get_visual_evidence_content())
 
         return AgentResult(
             sample_id=sample.id, question=sample.question,
@@ -229,7 +237,8 @@ class Orchestrator:
             scene_type=final_scene_type or None,
         )
         final = self.reflector.finalize(
-            sample.question, sample.answer_format, ctx_summary, final_memory_ctx)
+            sample.question, sample.answer_format, ctx_summary, final_memory_ctx,
+            visual_evidence=self.tools.get_visual_evidence_content())
 
         return AgentResult(
             sample_id=sample.id, question=sample.question,
@@ -251,12 +260,15 @@ class Orchestrator:
 
     def _prepare_run(self, sample: SpatialSample) -> None:
         self.tools.reset_context()
+        self.tools.set_checker_notes("")
         # Use a per-process output directory so concurrent processes don't overwrite each other.
         from agent.config import OUTPUTS_DIR
         import os
         self.tools.output_root = OUTPUTS_DIR / f"proc_{os.getpid()}"
+        shutil.rmtree(self.tools.output_root, ignore_errors=True)
         for subdir in ("da3", "sam3", "spatial"):
             (self.tools.output_root / subdir).mkdir(parents=True, exist_ok=True)
+        self.tools.context["output_root"] = str(self.tools.output_root)
         frame_paths = _downsample_frames(sample.image_paths, MAX_FRAMES_PER_SAMPLE)
         # Store in ctx for SKILLs and Reasoner to read
         self.tools.context["frame_paths"] = frame_paths
@@ -264,6 +276,10 @@ class Orchestrator:
         # VSI has no annotations; keep empty dict for compatibility
         self.tools.context["sample_annotations"] = sample.annotations
         self.tools.context["annotated_paths"] = frame_paths
+        self.tools.context["question"] = sample.question
+        self.tools.context["answer_format"] = sample.answer_format
+        self.tools.context["task_type"] = sample.task_type
+        self.tools.context["task_category"] = sample.task_category
 
     def _raw_tool_loop(self, sample: SpatialSample, plan: dict) -> int:
         """Run the fallback raw-tool plan; return number of rounds executed."""
@@ -285,7 +301,7 @@ class Orchestrator:
                 tool_name = action.get("tool", step["tool"])
                 # Guard against Reasoner hallucinating tool names — fall back
                 # to the planned tool if the LLM picked something outside the
-                # ten-tool whitelist.
+                # tool whitelist.
                 if tool_name not in KNOWN_TOOLS:
                     if self.verbose:
                         print(f"  ! Reasoner picked unknown tool {tool_name!r}; "
@@ -304,7 +320,8 @@ class Orchestrator:
                         print(f"     {r['result_summary']}")
 
             reflection = self.reflector.reflect(
-                sample.question, plan, self.tools.get_context_summary())
+                sample.question, plan, self.tools.get_context_summary(),
+                visual_evidence=self.tools.get_visual_evidence_content())
             if self.verbose:
                 print(f"[REFLECTOR] confidence={reflection.get('confidence', 0):.2f} "
                       f"decision={reflection.get('decision')}")

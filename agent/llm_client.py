@@ -15,7 +15,7 @@ class LLMClient:
         base_url: str,
         api_key: str,
         model: str,
-        timeout: int = 120,
+        timeout: int = 300,
         max_retries: int = 3,
         temperature: float = 0.7,
     ) -> None:
@@ -29,22 +29,23 @@ class LLMClient:
         )
 
     def chat(self, messages: list[dict], temperature: float | None = None,
-             max_tokens: int = 4096,
+             max_tokens: int = 8192,
              response_format: dict | None = None) -> str:
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature if temperature is not None else self.temperature,
             "max_tokens": max_tokens,
-            "enable_thinking": False,  # Qwen3 thinking off — saves 2000+ tokens & 50s per call
         }
+        if "qwen" in self.model.lower() or "dashscope" in self.model.lower():
+            payload["enable_thinking"] = False  # Qwen3 thinking off: saves tokens and latency.
         if response_format is not None:
             payload["response_format"] = response_format
         data = self._make_request(payload)
         return data["choices"][0]["message"]["content"]
 
     def chat_json(self, messages: list[dict], temperature: float | None = None,
-                  max_tokens: int = 4096) -> dict:
+                  max_tokens: int = 8192, include_raw: bool = False) -> dict:
         msgs = list(messages)
         if msgs and msgs[0]["role"] == "system":
             msgs[0] = {**msgs[0], "content": msgs[0]["content"] + "\n\nYou MUST respond with valid JSON only. No markdown fences, no explanation outside the JSON."}
@@ -63,12 +64,15 @@ class LLMClient:
                 raw = self.chat(msgs, temperature=temperature, max_tokens=max_tokens)
             parsed = self._try_parse_json(raw)
             if parsed is not None:
+                if include_raw:
+                    parsed = dict(parsed)
+                    parsed["_raw_response"] = raw
                 return parsed
             msgs.append({"role": "assistant", "content": raw})
             msgs.append({"role": "user", "content": "Your response was not valid JSON. Please fix it and respond with valid JSON only."})
         raise ValueError(
-            f"Failed to get valid JSON after 3 attempts. "
-            f"Last response head: {raw[:400]}...  tail: ...{raw[-400:]}"
+            "Failed to get valid JSON after 3 attempts. "
+            f"Full last response:\n{raw}"
         )
 
     def _make_request(self, payload: dict) -> dict:
@@ -89,7 +93,45 @@ class LLMClient:
         raise RuntimeError(f"LLM request failed after {self.max_retries} retries")
 
     @staticmethod
-    def _try_parse_json(text: str) -> dict | None:
+    def _extract_partial_json_fields(text: str) -> dict | None:
+        answer_match = re.search(r'"answer"\s*:\s*"([^"]*)"', text, re.DOTALL)
+        if not answer_match:
+            return None
+
+        result: dict = {"answer": answer_match.group(1)}
+
+        reasoning_match = re.search(r'"reasoning_chain"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
+        if reasoning_match:
+            reasoning = reasoning_match.group(1)
+            reasoning = reasoning.replace(r'\n', '\n').replace(r'\"', '"').replace(r'\\', '\\')
+            result["reasoning_chain"] = reasoning
+        else:
+            result["reasoning_chain"] = ""
+
+        conf_match = re.search(r'"confidence"\s*:\s*([0-9]+(?:\.[0-9]+)?)', text)
+        if conf_match:
+            try:
+                result["confidence"] = float(conf_match.group(1))
+            except ValueError:
+                result["confidence"] = 0.0
+        else:
+            result["confidence"] = 0.0
+
+        key_match = re.search(r'"key_evidence"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+        if key_match:
+            items = re.findall(r'"((?:[^"\\]|\\.)*)"', key_match.group(1), re.DOTALL)
+            result["key_evidence"] = [
+                item.replace(r'\n', '\n').replace(r'\"', '"').replace(r'\\', '\\')
+                for item in items
+            ]
+        else:
+            result["key_evidence"] = []
+
+        result["partial_parse"] = True
+        return result
+
+    @classmethod
+    def _try_parse_json(cls, text: str) -> dict | None:
         text = text.strip()
         m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
         if m:
@@ -102,4 +144,4 @@ class LLMClient:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            return None
+            return cls._extract_partial_json_fields(text)

@@ -2,10 +2,10 @@
 name: count_objects
 task_categories:
 - counting
-total_calls: 0
-success_count: 0
+total_calls: 1
+success_count: 1
 failure_count: 0
-success_rate: 0.0
+success_rate: 1.0
 version: 1
 seeded: true
 ---
@@ -21,14 +21,18 @@ Use this skill when asked to count distinct, moderately spaced instances of comm
 # Tool Sequence
 
 1. `depth_estimation` — required for 3D clustering downstream.
-2. `object_segmentation` — detect all candidate instances of `target` per frame.
+2. `object_segmentation` — use SAM3 video tracking to detect candidate instances of `target` across frames with stable track IDs.
 3. `instance_3d_localization` — cluster detections across frames by 3D proximity.
-4. `instance_counting` — read `total_unique` from the clustering result.
+4. `instance_counting` — let Checker review the target-specific annotated 32 frames when available, then read authoritative `total_unique`.
 
 # Known Pitfalls
 
 None yet.
 
 # Examples
+
+None yet.
+
+# Checker
 
 None yet.

@@ -22,6 +22,12 @@ from agent.llm_client import LLMClient
 from agent.planner import FRAMEWORK_OVERVIEW, format_plan
 
 
+def _with_visual_evidence(text: str, visual_evidence: list[dict] | None = None):
+    if not visual_evidence:
+        return text
+    return [{"type": "text", "text": text}] + list(visual_evidence)
+
+
 # ─── reflect ──────────────────────────────────────────────────────────
 
 def reflector_system_prompt() -> str:
@@ -44,7 +50,9 @@ TERMINATE (confidence >= 0.8) when:
 - Distance question: you have a computed distance value from distance_computation.
 - Counting question: you have the instance count from instance_counting.
 - Spatial-relation question: you have direction labels from direction_computation.
-- Room size / object size question: you have extents from scene_size_computation or bbox_size from instance_3d_localization.
+- Object-size question: you have a computed size value from object_size_computation.
+- Room-size question: you have extents from scene_size_computation.
+- Checker raw-sample direct answer exists because a required SAM3 target had zero tracks.
 
 CONTINUE when:
 - A tool in the plan failed and needs retry with different parameters.
@@ -116,22 +124,31 @@ You are the FINALIZER. Given all accumulated evidence, produce the FINAL answer.
 Output JSON:
 {{
     "answer": "the answer value ONLY — see format rules",
-    "reasoning_chain": "step-by-step: which evidence was used, how you derived the answer",
+    "reasoning_chain": "brief reasoning: keep it concise, focusing only on the decisive evidence and final option mapping when relevant",
     "confidence": 0.0-1.0,
     "key_evidence": ["the 1-3 most important pieces of evidence that determined the answer"]
 }}
+
+Keep the JSON reasonably concise. Prefer short reasoning_chain text and avoid unnecessary long explanations or full option-list restatements.
 
 Answer format rules (STRICT — wrong format = wrong answer):
 - Numeric fill: ONLY the number. "0.6", "3", "16". No units, no words.
 - Multiple choice: ONLY one letter (A/B/C/D). Nothing else.
 - Yes/No: ONLY "Yes" or "No".
 
+Multiple-choice selection rule:
+- First derive the semantic answer from evidence.
+- Then compare that derived answer against EVERY option text in the question.
+- Return the letter whose option text exactly matches the derived answer.
+- If your reasoning says one option text but your answer letter points to another option, the answer is wrong. Re-check the option mapping before finalizing.
+- For ordering questions, preserve the full comma-separated order and match it exactly to the listed option text.
+
 How to derive answers from evidence:
 - [distance_computation] → distance in meters, rounded to 1 decimal
 - [instance_counting] → total_unique count
 - [scene_size_computation] → floor_area (rounded to integer) for room-size questions
-- [instance_3d_localization] → bbox_size for object-size questions
-- [direction_computation] → match the direction label to the multiple-choice options
+- [object_size_computation] → bbox_size_xyz and bbox volume for object-size questions; if the question asks a specific width/height/depth/longest/shortest dimension, derive it from bbox_size_xyz and then match the requested answer format
+- [direction_computation] → match the direction label to the multiple-choice options; use angle_from_forward_deg when the question defines front/back thresholds or asks about angular relation
 
 Size sanity check via memory priors (if present in the memory context):
 - If your computed object size is >3× or <0.3× the prior mean, treat it as suspicious and lower confidence — likely a depth or segmentation error.
@@ -164,29 +181,35 @@ class Reflector:
         self.llm = llm
 
     def reflect(self, question: str, plan: dict,
-                context_summary: str, failure_patterns: str = "") -> dict:
+                context_summary: str, failure_patterns: str = "",
+                visual_evidence: list[dict] | None = None) -> dict:
+        text = reflector_user_message(
+            question, plan, context_summary, failure_patterns)
         messages = [
             {"role": "system", "content": reflector_system_prompt()},
-            {"role": "user", "content": reflector_user_message(
-                question, plan, context_summary, failure_patterns)},
+            {"role": "user", "content": _with_visual_evidence(text, visual_evidence)},
         ]
         return self.llm.chat_json(messages)
 
     def reconstruct(self, sample, plan: dict, predicted: str,
-                    context_summary: str, tool_descriptions: str) -> dict:
+                    context_summary: str, tool_descriptions: str,
+                    visual_evidence: list[dict] | None = None) -> dict:
+        text = reconstructor_user_message(
+            sample.question, sample.gt_answer, predicted, plan, context_summary)
         messages = [
             {"role": "system", "content": reconstructor_system_prompt(tool_descriptions)},
-            {"role": "user", "content": reconstructor_user_message(
-                sample.question, sample.gt_answer, predicted, plan, context_summary)},
+            {"role": "user", "content": _with_visual_evidence(text, visual_evidence)},
         ]
         # reconstruct produces a full corrected plan; give it headroom.
         return self.llm.chat_json(messages, max_tokens=6144)
 
     def finalize(self, question: str, answer_format: str,
-                 context_summary: str, memory_context: str = "") -> dict:
+                 context_summary: str, memory_context: str = "",
+                 visual_evidence: list[dict] | None = None) -> dict:
+        text = finalizer_user_message(
+            question, answer_format, context_summary, memory_context)
         messages = [
             {"role": "system", "content": finalizer_system_prompt()},
-            {"role": "user", "content": finalizer_user_message(
-                question, answer_format, context_summary, memory_context)},
+            {"role": "user", "content": _with_visual_evidence(text, visual_evidence)},
         ]
         return self.llm.chat_json(messages)

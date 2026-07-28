@@ -99,12 +99,28 @@ def evolve_after_sample(
         )
         if corrected is not None:
             _, corrected_result, _ = corrected
-            pitfall_text = distill_pitfall(result, corrected_result, llm, verbose=verbose)
-            if pitfall_text:
-                for name in result.skills_used:
+            for name in result.skills_used:
+                skill = skill_lib.get(name)
+                if skill is None:
+                    continue
+                lessons = distill_failure_lessons(
+                    sample, result, corrected_result, llm,
+                    skill=skill, verbose=verbose)
+                pitfall_text = lessons.get("pitfall", "")
+                example_text = lessons.get("example", "")
+                checker_text = lessons.get("checker", "")
+                if pitfall_text:
                     skill_lib.append_pitfall(name, pitfall_text)
                     skill_lib.bump_version(name)
                     updates["skill_updates"].append(f"{name}:pitfall")
+                if example_text:
+                    if skill_lib.append_example(name, example_text, sample_id=str(sample.id)):
+                        skill_lib.bump_version(name)
+                        updates["skill_updates"].append(f"{name}:example")
+                if checker_text:
+                    if skill_lib.append_checker_note(name, checker_text):
+                        skill_lib.bump_version(name)
+                        updates["skill_updates"].append(f"{name}:checker")
         else:
             memory.record_unsolved(
                 sample.id, sample.task_type,
@@ -159,7 +175,8 @@ def _reflect_and_verify(sample, result, reflector, orchestrator,
     for attempt in range(REFLECT_MAX_ATTEMPTS):
         rc = reflector.reconstruct(
             sample, result.plan, result.predicted_answer,
-            result.final_context, tool_descriptions)
+            result.final_context, tool_descriptions,
+            visual_evidence=orchestrator.tools.get_visual_evidence_content())
         corrected_plan = rc.get("corrected_plan", [])
         if not corrected_plan:
             return None
@@ -306,8 +323,11 @@ Reference example (measure_distance-style):
 ```
 
 Constraints:
-- Only use tools from: depth_estimation, bev_generation, novel_view_synthesis, object_segmentation, annotation_localization, instance_3d_localization, instance_counting, distance_computation, direction_computation, scene_size_computation.
+- Only use tools from: depth_estimation, bev_generation, novel_view_synthesis, object_segmentation, annotation_localization, instance_3d_localization, instance_counting, distance_computation, direction_computation, object_size_computation, scene_size_computation.
 - Keep execute_py_body concise and defensive: check `r["success"]` after every tool call and return early on failure.
+- For distance_computation, direction_computation, and object_size_computation, prefer object-name parameters from `params` (e.g. `obj_a`, `obj_b`, `object_name`, `viewpoint_target`, `reference_target`, `target_target`, `facing_target`). The tool layer will run Checker and resolve the final instance.
+- Never emit placeholder IDs such as `<id_of_chair>` or `chair_instance_id`. Use integer IDs only when the execute body obtained a concrete ID from prior tool context.
+- Object-size evidence should be treated as bbox_size_xyz plus bbox volume; derive a requested width/height/depth/longest/shortest value only when the final task needs it.
 """
     resp = llm.chat_json([{"role": "system", "content": "You design reusable SKILLs."},
                           {"role": "user", "content": prompt}],
@@ -393,13 +413,77 @@ Constraints:
     return name
 
 
-def distill_pitfall(fail_result: AgentResult, corrected_result: AgentResult,
-                    llm: LLMClient, verbose: bool = False) -> str:
-    """Compare the failed vs corrected trajectory and produce a one-line
-    pitfall entry for the SKILL's `Known Pitfalls` section."""
-    prompt = f"""You are extracting a durable pitfall lesson from a corrected failure.
+def distill_failure_lessons(sample, fail_result: AgentResult, corrected_result: AgentResult,
+                            llm: LLMClient, skill: Skill | None = None,
+                            verbose: bool = False) -> dict[str, str]:
+    """Distill one corrected failure into optional Pitfall and Example entries.
+
+    This is a single LLM request. Pitfall is category/tool-strategy oriented;
+    Example is sample-question oriented and should only be emitted when the
+    question/sample itself teaches a useful task-specific lesson.
+    """
+    skill_name = skill.name if skill is not None else str(fail_result.chosen_skill or "")
+    existing_pitfalls = (skill.sections.get("Known Pitfalls", "").strip()
+                         if skill is not None else "")
+    existing_examples = (skill.sections.get("Examples", "").strip()
+                         if skill is not None else "")
+    existing_checker = (skill.sections.get("Checker", "").strip()
+                        if skill is not None else "")
+    prompt = f"""You are updating one SpatialMem SKILL after a failed run was corrected and verified.
+
+SKILL being updated: {skill_name or "(unknown)"}
+
+Existing `Known Pitfalls`:
+---
+{existing_pitfalls or "None yet."}
+---
+
+Existing `Examples`:
+---
+{existing_examples or "None yet."}
+---
+
+Existing `Checker`:
+---
+{existing_checker or "None yet."}
+---
+
+Produce zero or more updates:
+
+1. Known Pitfall:
+   A compact general warning about what can go wrong for this SKILL. This should
+   focus on planning/tool-use traps that may recur across similar samples.
+
+2. Example:
+   A compact sample-specific insight for the SKILL's `Examples` section. Add this
+   ONLY if this particular question/sample is educational. The insight can be
+   about question interpretation, category boundary decisions (e.g. whether a
+   loveseat counts as a chair), viewpoint/reference/facing semantics, exact
+   option matching, special definitions/thresholds, scene-specific ambiguity, or
+   any other detail tightly tied to THIS question text. Do not force it into a
+   fixed parameter-extraction template, and do not write generic tool advice.
+
+3. Checker:
+   A compact Checker-specific lesson. Add this ONLY if this sample used Checker
+   and the failure/correction was mainly caused by Checker behavior, such as
+   choosing the wrong target track, keeping/dropping the wrong frames, accepting
+   a spurious track, missing a real target in count calibration, or direct-answer
+   fallback from raw frames. If the final context contains no `[checker]` entry,
+   set `checker_is_new=false`.
+
+You may output any subset of pitfall/example/checker, or none.
+Avoid low-information repetition:
+- If the proposed pitfall is already covered by Existing `Known Pitfalls`, set `pitfall_is_new=false`.
+- If the proposed example insight is already covered by Existing `Examples`, set `example_is_useful=false`.
+- If the proposed checker lesson is already covered by Existing `Checker`, set `checker_is_new=false`.
+- A new example should add a distinct sample-specific nuance, not just restate the same lesson on another question.
 
 Question type: {fail_result.task_category}
+Sample id: {sample.id}
+Original question:
+{sample.question}
+Ground truth answer: {sample.gt_answer}
+
 Failed trajectory (wrong answer '{fail_result.predicted_answer}', GT '{fail_result.gt_answer}'):
   tool calls: {[tc["tool_name"] for tc in fail_result.tool_calls]}
   plan: {json.dumps(fail_result.plan, ensure_ascii=False)[:600]}
@@ -413,19 +497,45 @@ Corrected re-run (answer '{corrected_result.predicted_answer}' matched GT):
 
 Output JSON:
 {{
-    "pitfall": "<one-line lesson: **[trigger condition]** description → mitigation, e.g. **[Small target objects]** SAM3 misses tiny instances at low resolution → use higher process_res or add visual descriptors>",
-    "is_new": true | false,     // false if this is a generic non-pattern (like a random numeric drift)
+    "pitfall_is_new": true | false,
+    "pitfall": "<one-line general lesson for Known Pitfalls, or empty string>",
+    "example_is_useful": true | false,
+    "example": "<1-3 concise sentences capturing the sample-specific insight, or empty string>",
+    "checker_is_new": true | false,
+    "checker": "<one-line Checker-specific lesson, or empty string>",
     "rationale": "1 sentence"
 }}
 """
-    resp = llm.chat_json([{"role": "system", "content": "You distill failure patterns."},
+    resp = llm.chat_json([{"role": "system", "content": "You distill SKILL updates."},
                           {"role": "user", "content": prompt}])
-    if not resp.get("is_new"):
-        return ""
-    text = resp.get("pitfall", "").strip()
-    if verbose and text:
-        print(f"[EVOLVE] distill_pitfall: {text}")
-    return text
+    out = {"pitfall": "", "example": "", "checker": ""}
+
+    if resp.get("pitfall_is_new"):
+        out["pitfall"] = str(resp.get("pitfall", "")).strip()
+        if verbose and out["pitfall"]:
+            print(f"[EVOLVE] distill_failure_lessons pitfall: {out['pitfall']}")
+
+    if resp.get("example_is_useful"):
+        insight = str(resp.get("example", "")).strip()
+        if insight:
+            question = str(sample.question).strip().replace("\n", " ")
+            entry = (
+                f"- **Sample {sample.id}**\n"
+                f"  - Question: {question}\n"
+                f"  - Insight: {insight}"
+            )
+            out["example"] = entry
+            if verbose:
+                print(f"[EVOLVE] distill_failure_lessons example: sample {sample.id}")
+
+    if resp.get("checker_is_new"):
+        checker_note = str(resp.get("checker", "")).strip()
+        if checker_note:
+            out["checker"] = checker_note
+            if verbose:
+                print(f"[EVOLVE] distill_failure_lessons checker: {checker_note}")
+
+    return out
 
 
 # ─── Proactive category-level bootstrap ───────────────────────────────
@@ -567,8 +677,10 @@ Contract for `execute_py_body`:
 3. Read frame paths from `frame_paths = ctx["frame_paths"]`.
 4. Read caller params via `params.get("target", "default")`.
 5. Return `{{"success": bool, "tool_calls": list, "summary": str}}`.
-6. Only use tools from: depth_estimation, bev_generation, novel_view_synthesis, object_segmentation, annotation_localization, instance_3d_localization, instance_counting, distance_computation, direction_computation, scene_size_computation.
+6. Only use tools from: depth_estimation, bev_generation, novel_view_synthesis, object_segmentation, annotation_localization, instance_3d_localization, instance_counting, distance_computation, direction_computation, object_size_computation, scene_size_computation.
 7. Be defensive: check `r["success"]` after every tool call.
+8. Prefer object-name parameters for distance/direction/object-size tools and let the tool layer resolve final instances with Checker. Never generate placeholder IDs like `<id_of_chair>`.
+9. For object-size tasks, preserve bbox_size_xyz/volume as the general evidence; derive a specific dimension only if the question requires it.
 
 If you cannot design a coherent SKILL for this category (e.g., tools do not support the required semantics), output `{{"name": "", "unsupported_reason": "..."}}` and we will skip bootstrap.
 """
@@ -760,6 +872,10 @@ seeded: false
 None yet.
 
 # Examples
+
+None yet.
+
+# Checker
 
 None yet.
 """

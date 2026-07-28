@@ -28,7 +28,7 @@ from agent.config import SKILLS_DIR, SKILLS_PENDING_DIR, PENDING_PROMOTE_K
 
 
 SKILL_MD_SECTIONS = ("When to Use", "Parameters", "Tool Sequence",
-                     "Known Pitfalls", "Examples")
+                     "Known Pitfalls", "Examples", "Checker")
 
 
 # Module-level lock: SkillLib writes SKILL.md and trajectories.jsonl files
@@ -63,35 +63,36 @@ class Skill:
     def success_count(self) -> int:
         return int(self.frontmatter.get("success_count", 0))
 
-    def brief(self, max_chars_wtu: int = 300, max_chars_params: int = 400) -> str:
-        """Compact multi-line summary for planner prompts.
+    def brief(self, max_chars_section: int = 900) -> str:
+        """Compact SKILL.md rendering for planner prompts.
 
-        Includes name, categories, stats, When to Use, and Parameters — the
-        Planner needs Parameters to fill skill_params correctly, otherwise
-        it invents tool-level keys.
+        Planner should see the skill's operational contract and accumulated
+        experience, not only its name. Each section is capped independently so
+        Examples/Pitfalls can grow without crowding out other retrieved skills.
         """
         # Detect if this SKILL is currently sitting in the pending dir
         is_pending = "pending" in self.dir.parts
         pending_tag = "  [AUTO-DISTILLED — this SKILL was self-summarized by the system for this task category; feel free to use it if it fits your current task]" if is_pending else ""
 
-        wtu = self.sections.get("When to Use", "").strip()
-        if len(wtu) > max_chars_wtu:
-            wtu = wtu[:max_chars_wtu].rstrip() + "..."
-        params = self.sections.get("Parameters", "").strip()
-        if len(params) > max_chars_params:
-            params = params[:max_chars_params].rstrip() + "..."
-        pitfalls = self.sections.get("Known Pitfalls", "").strip()
-        pit_line = ""
-        if pitfalls and pitfalls.lower() not in ("none yet.", "none."):
-            pit_line = f"\n  Known pitfalls: {pitfalls[:200]}"
-        return (f"{self.name}{pending_tag} "
-                f"(task_categories={self.task_categories}, "
-                f"success_rate={self.success_rate:.2f}, "
-                f"calls={self.total_calls}, "
-                f"seeded={self.frontmatter.get('seeded', False)})\n"
-                f"  When to use: {wtu}\n"
-                f"  Parameters:\n    {params.replace(chr(10), chr(10) + '    ')}"
-                f"{pit_line}")
+        def _section(name: str) -> str:
+            body = self.sections.get(name, "").strip() or "None."
+            if len(body) > max_chars_section:
+                body = body[:max_chars_section].rstrip() + "..."
+            return f"## {name}\n{body}"
+
+        sections = "\n\n".join(
+            _section(name)
+            for name in ("When to Use", "Parameters", "Tool Sequence",
+                         "Known Pitfalls", "Examples")
+        )
+        return (
+            f"# SKILL: {self.name}{pending_tag}\n"
+            f"metadata: task_categories={self.task_categories}, "
+            f"success_rate={self.success_rate:.2f}, calls={self.total_calls}, "
+            f"seeded={self.frontmatter.get('seeded', False)}, "
+            f"version={self.frontmatter.get('version', 0)}\n\n"
+            f"{sections}"
+        )
 
 
 class SkillLib:
@@ -180,8 +181,10 @@ class SkillLib:
             (skill.dir / "trajectories.jsonl").open("a", encoding="utf-8").write(line + "\n")
 
     def append_pitfall(self, skill_name: str, entry_text: str) -> None:
-        """Append a bullet to Known Pitfalls. Caller (evolve.distill_pitfall)
-        must have already decided this is a genuinely new pitfall."""
+        """Append a bullet to Known Pitfalls.
+
+        Caller must have already decided this is a genuinely new pitfall.
+        """
         with _SKILL_LOCK:
             skill = self.get(skill_name)
             if skill is None:
@@ -193,6 +196,52 @@ class SkillLib:
                 new_body = current + "\n- " + entry_text.strip()
             skill.sections["Known Pitfalls"] = new_body
             self._save_sections(skill)
+
+    def append_example(self, skill_name: str, entry_text: str,
+                       sample_id: str | None = None) -> bool:
+        """Append one sample-specific insight to Examples.
+
+        Examples are intentionally not generic tool pitfalls. They capture a
+        concrete question/sample detail that is useful to remember.
+        """
+        entry_text = entry_text.strip()
+        if not entry_text:
+            return False
+        with _SKILL_LOCK:
+            skill = self.get(skill_name)
+            if skill is None:
+                return False
+            current = skill.sections.get("Examples", "").strip()
+            if sample_id and f"Sample {sample_id}" in current:
+                return False
+            if current.lower() in ("", "none yet.", "none."):
+                new_body = entry_text
+            else:
+                new_body = current + "\n\n" + entry_text
+            skill.sections["Examples"] = new_body
+            self._save_sections(skill)
+            return True
+
+    def append_checker_note(self, skill_name: str, entry_text: str) -> bool:
+        """Append one Checker-specific lesson to the Checker section."""
+        entry_text = entry_text.strip()
+        if not entry_text:
+            return False
+        with _SKILL_LOCK:
+            skill = self.get(skill_name)
+            if skill is None:
+                return False
+            current = skill.sections.get("Checker", "").strip()
+            if current.lower() in ("", "none yet.", "none."):
+                new_body = "- " + entry_text.lstrip("- ").strip()
+            else:
+                normalized = entry_text.lstrip("- ").strip()
+                if normalized in current:
+                    return False
+                new_body = current + "\n- " + normalized
+            skill.sections["Checker"] = new_body
+            self._save_sections(skill)
+            return True
 
     def rewrite_section(self, skill_name: str, section: str, new_text: str) -> None:
         """Overwrite an entire section body."""

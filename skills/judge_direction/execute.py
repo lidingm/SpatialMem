@@ -16,7 +16,7 @@ target_target : str  (REQUIRED)
 viewpoint_type : str
     "camera"  – observer is the camera at frame `viewpoint_frame`.
     "object"  – observer is at object `viewpoint_target`.
-    Default: "camera".
+    Default: "object" when `viewpoint_target` is provided, otherwise "camera".
 
 viewpoint_target : str  (required when viewpoint_type="object")
     Object name of WHERE the person stands.
@@ -44,9 +44,11 @@ def execute(sample, tools, ctx, params=None):
     params = params or {}
     reference_target: str = params.get("reference_target", "")
     target_target:    str = params.get("target_target",    "")
-    viewpoint_type:   str = params.get("viewpoint_type",   "camera")
     viewpoint_target: str = params.get("viewpoint_target", "")
     facing_target:    str = params.get("facing_target",    "")
+    viewpoint_type:   str = params.get("viewpoint_type") or (
+        "object" if viewpoint_target else "camera"
+    )
     viewpoint_frame:  int = int(params.get("viewpoint_frame", 0))
 
     if not reference_target or not target_target:
@@ -90,74 +92,37 @@ def execute(sample, tools, ctx, params=None):
         return {"success": False, "tool_calls": calls,
                 "summary": f"instance_3d_localization failed: {r['error']}"}
 
-    # ── Step 4: resolve instance IDs by label ────────────────────────
-    r3d = ctx.get("results_3d", {})
-    merged_labels = r3d.get("merged_labels", [])
-    obj_ids = r3d.get("obj_id_list", [])
-
-    def _find_id(label: str) -> int | None:
-        for i in obj_ids:
-            if i < len(merged_labels) and merged_labels[i] == label:
-                return i
-        return None
-
-    reference_id = _find_id(reference_target)
-    target_id    = _find_id(target_target)
-
-    if reference_id is None:
-        return {"success": False, "tool_calls": calls,
-                "summary": f"no instance found for reference_target={reference_target!r}; "
-                           f"detected labels={merged_labels}"}
-    if target_id is None:
-        return {"success": False, "tool_calls": calls,
-                "summary": f"no instance found for target_target={target_target!r}; "
-                           f"detected labels={merged_labels}"}
-
-    # ── Step 5: build direction_computation params ────────────────────
+    # ── Step 4: build direction_computation params ────────────────────
+    # Pass names, not guessed IDs. The tool layer runs Checker and resolves
+    # the final instance/frames for each target.
     if viewpoint_type == "camera":
         dir_params = {
             "viewpoint":      viewpoint_frame,
             "viewpoint_type": "camera",
-            "reference":      reference_id,
+            "reference_target": reference_target,
             "reference_type": "object",
-            "target":         target_id,
+            "target_target":  target_target,
             "target_type":    "object",
         }
 
     else:  # viewpoint_type == "object"
-        vp_id     = _find_id(viewpoint_target)
-        facing_id = _find_id(facing_target) if facing_target else None
-
-        if vp_id is None:
-            # viewpoint_target not detected → fall back to camera
-            dir_params = {
-                "viewpoint":      viewpoint_frame,
-                "viewpoint_type": "camera",
-                "reference":      reference_id,
-                "reference_type": "object",
-                "target":         target_id,
-                "target_type":    "object",
-            }
-        else:
-            dir_params = {
-                "viewpoint":      vp_id,
-                "viewpoint_type": "object",
-                "reference":      reference_id,
-                "reference_type": "object",
-                "target":         target_id,
-                "target_type":    "object",
-            }
-            # Add facing if provided (or if viewpoint == reference, facing is required)
-            if facing_id is not None:
-                dir_params["facing"]      = facing_id
-                dir_params["facing_type"] = "object"
-            elif vp_id == reference_id:
-                # viewpoint = reference but no facing → forward = 0, direction undefined
-                return {"success": False, "tool_calls": calls,
-                        "summary": f"viewpoint_target={viewpoint_target!r} and "
-                                   f"reference_target={reference_target!r} resolved to the same "
-                                   f"instance (id={vp_id}), so forward direction is undefined. "
-                                   f"Please provide 'facing_target' to specify the facing direction."}
+        dir_params = {
+            "viewpoint_type": "object",
+            "viewpoint_target": viewpoint_target,
+            "reference_type": "object",
+            "reference_target": reference_target,
+            "target_type":    "object",
+            "target_target":  target_target,
+        }
+        # Add facing if provided (or if viewpoint == reference, facing is required)
+        if facing_target:
+            dir_params["facing_type"] = "object"
+            dir_params["facing_target"] = facing_target
+        elif viewpoint_target == reference_target:
+            return {"success": False, "tool_calls": calls,
+                    "summary": f"viewpoint_target={viewpoint_target!r} and "
+                               f"reference_target={reference_target!r} are the same target, "
+                               f"so forward direction is undefined without facing_target."}
 
     r = _call("direction_computation", dir_params)
     return {

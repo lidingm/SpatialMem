@@ -9,7 +9,15 @@ from __future__ import annotations
 
 import numpy as np
 
-from tools.code_execution.distance_computation import get_camera_position
+from tools.code_execution.distance_computation import (
+    category_from_id,
+    checker_direct_answer,
+    checker_locate_or_fallback,
+    find_first_instance_id,
+    get_camera_position,
+    instance_geometry,
+)
+from tools.visual_generation.sam3_segmentation import missing_tracked_categories
 
 
 def _resolve_position(
@@ -61,6 +69,7 @@ def compute_relative_direction(
           fb_label     - str, "front" / "back" / "center"
           lr_angle_deg - float, 左右偏角（左为正，右为负）
           fb_angle_deg - float, 前后偏角（前为正，后为负）
+          angle_from_forward_deg - float, 观察正前方到 reference→target 方向的夹角，0-180
           distance_ref_to_target - float, reference 与 target 之间的距离
     """
     if up is None:
@@ -83,6 +92,7 @@ def compute_relative_direction(
             "direction": "undefined",
             "lr_label": "undefined", "fb_label": "undefined",
             "lr_angle_deg": 0.0, "fb_angle_deg": 0.0,
+            "angle_from_forward_deg": 0.0,
             "distance_ref_to_target": float(np.linalg.norm(tgt - ref)),
         }
     forward_h = forward_h / norm_fh
@@ -106,9 +116,12 @@ def compute_relative_direction(
     if horiz_dist < 1e-6:
         lr_angle = 0.0
         fb_angle = 0.0
+        angle_from_forward = 0.0
     else:
         lr_angle = float(np.degrees(np.arctan2(-lr_proj, fb_proj)))
         fb_angle = float(np.degrees(np.arctan2(fb_proj, abs(lr_proj))))
+        cosang = float(np.clip(fb_proj / max(horiz_dist, 1e-8), -1.0, 1.0))
+        angle_from_forward = float(np.degrees(np.arccos(cosang)))
 
     angle_thresh = 20.0
     abs_lr = abs(lr_angle)
@@ -140,5 +153,149 @@ def compute_relative_direction(
         "fb_label": fb_label,
         "lr_angle_deg": lr_angle,
         "fb_angle_deg": fb_angle,
+        "angle_from_forward_deg": angle_from_forward,
         "distance_ref_to_target": ref_tgt_dist,
     }
+
+
+# ─── Formal task workflow ──────────────────────────────────────────────────
+
+def _name_from_params(params: dict, name_key: str, id_key: str, r3d: dict) -> str | None:
+    return params.get(name_key) or category_from_id(r3d, params.get(id_key))
+
+
+def _resolve_checked_object(
+    params_id,
+    object_name: str | None,
+    ctx: dict,
+    checker,
+    loc_cache: dict[str, dict],
+) -> tuple[np.ndarray, dict]:
+    r3d = ctx["results_3d"]
+    fallback_id = params_id
+    if fallback_id is None and object_name:
+        fallback_id = find_first_instance_id(r3d, object_name)
+    if fallback_id is None:
+        ids = r3d.get("obj_id_list", [])
+        fallback_id = int(ids[0]) if ids else None
+    if fallback_id is None:
+        raise RuntimeError(f"no instance found for object {object_name!r}")
+
+    key = object_name or str(fallback_id)
+    if key not in loc_cache:
+        loc_cache[key] = checker_locate_or_fallback(checker, ctx, key, int(fallback_id))
+    loc = loc_cache[key]
+    geom = instance_geometry(ctx, int(loc["instance_id"]), loc.get("keep_frames"))
+    return geom["avg_pos"], loc
+
+
+def _resolve_entity(
+    entity_id,
+    entity_type: str,
+    object_name: str | None,
+    ctx: dict,
+    checker,
+    loc_cache: dict[str, dict],
+) -> tuple[np.ndarray, dict | None, str]:
+    if entity_type == "camera":
+        fi = int(entity_id or 0)
+        return get_camera_position(ctx["da3_result"]["extrinsics"], fi), None, f"camera(frame {fi})"
+    pos, loc = _resolve_checked_object(entity_id, object_name, ctx, checker, loc_cache)
+    return pos, loc, object_name or f"instance {loc.get('instance_id')}"
+
+
+def run_direction_task(
+    params: dict,
+    ctx: dict,
+    checker,
+    frame_paths: list[str],
+) -> dict:
+    """Formal direction workflow with Checker-based target validation."""
+    r3d = ctx.get("results_3d")
+    da3 = ctx.get("da3_result")
+    if r3d is None:
+        raise RuntimeError("instance_3d_localization must be run first")
+    if da3 is None:
+        raise RuntimeError("depth_estimation must be run first")
+
+    vp_type = params.get("viewpoint_type", "camera")
+    ref_type = params.get("reference_type", "object")
+    tgt_type = params.get("target_type", "object")
+    fac_type = params.get("facing_type", "object")
+
+    if vp_type == "camera":
+        vp_id = params.get("viewpoint", params.get("viewpoint_frame", 0))
+    else:
+        vp_id = params.get("viewpoint")
+    ref_id = params.get("reference")
+    tgt_id = params.get("target")
+    fac_id = params.get("facing")
+
+    vp_name = params.get("viewpoint_object") or params.get("viewpoint_target") \
+        or _name_from_params(params, "viewpoint_name", "viewpoint", r3d)
+    ref_name = params.get("reference_object") or params.get("reference_target") \
+        or _name_from_params(params, "reference_name", "reference", r3d)
+    tgt_name = params.get("target_object") or params.get("target_target") \
+        or _name_from_params(params, "target_name", "target", r3d)
+    fac_name = params.get("facing_object") or params.get("facing_target") \
+        or _name_from_params(params, "facing_name", "facing", r3d)
+
+    required: list[str] = []
+    for typ, name in ((vp_type, vp_name), (ref_type, ref_name),
+                      (tgt_type, tgt_name), (fac_type, fac_name if fac_id is not None or fac_name else None)):
+        if typ == "object" and name and name not in required:
+            required.append(name)
+    missing = missing_tracked_categories(ctx, required)
+    if missing:
+        return checker_direct_answer(
+            checker, ctx, frame_paths,
+            reason=f"SAM3 produced zero tracks for required target category/categories: {missing}",
+        )
+
+    loc_cache: dict[str, dict] = {}
+    viewpoint_pos, vp_loc, vp_label = _resolve_entity(
+        vp_id, vp_type, vp_name, ctx, checker, loc_cache)
+    reference_pos, ref_loc, ref_label = _resolve_entity(
+        ref_id, ref_type, ref_name, ctx, checker, loc_cache)
+    target_pos, tgt_loc, tgt_label = _resolve_entity(
+        tgt_id, tgt_type, tgt_name, ctx, checker, loc_cache)
+    facing_pos = None
+    fac_label = ""
+    fac_loc = None
+    if fac_id is not None or fac_name:
+        facing_pos, fac_loc, fac_label = _resolve_entity(
+            fac_id, fac_type, fac_name, ctx, checker, loc_cache)
+
+    from tools.code_execution.distance_computation import _render_final_localizations
+    _render_final_localizations(ctx)
+
+    dr = compute_relative_direction(
+        viewpoint=viewpoint_pos,
+        reference=reference_pos,
+        target=target_pos,
+        facing=facing_pos,
+        extrinsics=da3["extrinsics"],
+    )
+    result = {
+        **dr,
+        "viewpoint": vp_label,
+        "reference": ref_label,
+        "target": tgt_label,
+        "facing": fac_label or None,
+        "checker": {
+            k: v for k, v in {
+                "viewpoint": vp_loc,
+                "reference": ref_loc,
+                "target": tgt_loc,
+                "facing": fac_loc,
+            }.items() if v is not None
+        },
+    }
+    ctx["direction"] = result
+    summary = (
+        f"Direction from {vp_label}{' facing ' + fac_label if fac_label else ''}: "
+        f"{tgt_label} is {dr['direction']} of {ref_label} "
+        f"(angle_from_forward={dr['angle_from_forward_deg']:.1f}deg, "
+        f"lr_angle={dr['lr_angle_deg']:.1f}deg, fb_angle={dr['fb_angle_deg']:.1f}deg)"
+    )
+    return {"direct_answer": False, "direction": result, "summary": summary}

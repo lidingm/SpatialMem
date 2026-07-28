@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from agent.config import (
-    VSI_IMAGES_ROOT, VSI_PARQUET,
+    VSI_IMAGES_ROOT, VSI_PARQUET, VSI_TEST_JSONL,
     VSI_TRAIN_IMAGES_ROOT, VSI_TRAIN_JSONL,
     SPAR_IMAGES_ROOT, SPAR_JSONL_ROOT, SPAR_RENDER_DIR,
 )
@@ -187,6 +187,86 @@ class VSIBenchDataLoader:
                 "dataset": str(row["dataset"]),
                 "scene_name": str(row["scene_name"]),
                 "question_type": str(row["question_type"]),
+                "options": list(options) if has_options else None,
+            },
+        )
+
+
+class VSIBenchJSONLDataLoader:
+    """VSI-Bench test set loaded from test.jsonl (no parquet / pyarrow needed).
+
+    Same interface as VSIBenchDataLoader / VSITrain10KDataLoader:
+    question_types(), load_task_type(), load_ids() → SpatialSample objects.
+    Frames resolve from images_root/<dataset>/<scene_name>/frame-*.jpg.
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str | Path | None = None,
+        images_root: str | Path | None = None,
+    ):
+        self.jsonl_path = Path(jsonl_path or VSI_TEST_JSONL)
+        self.images_root = Path(images_root or VSI_IMAGES_ROOT)
+        self._rows: list[dict] | None = None
+
+    @property
+    def rows(self) -> list[dict]:
+        if self._rows is None:
+            self._rows = []
+            with self.jsonl_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        self._rows.append(json.loads(line))
+        return self._rows
+
+    def question_types(self) -> list[str]:
+        return sorted({str(r["question_type"]) for r in self.rows})
+
+    def load_task_type(
+        self,
+        question_type: str,
+        max_samples: int | None = None,
+        shuffle: bool = False,
+        seed: int = 42,
+    ) -> list[SpatialSample]:
+        rows = [r for r in self.rows if str(r["question_type"]) == question_type]
+        if shuffle:
+            import random
+            random.Random(seed).shuffle(rows)
+        if max_samples is not None:
+            rows = rows[:max_samples]
+        return [self._row_to_sample(r) for r in rows]
+
+    def load_ids(self, ids: list[str | int]) -> list[SpatialSample]:
+        idset = {str(i) for i in ids}
+        return [self._row_to_sample(r) for r in self.rows if str(r["id"]) in idset]
+
+    def _row_to_sample(self, r: dict) -> SpatialSample:
+        scene_dir = self.images_root / str(r["dataset"]) / str(r["scene_name"])
+        image_paths = _list_scene_frames(scene_dir)
+
+        options = r.get("options")
+        has_options = bool(options)
+        answer_format = "select" if has_options else "fill"
+
+        question = str(r["question"])
+        if has_options:
+            question = question + "\n" + "\n".join(str(o) for o in options)
+
+        return SpatialSample(
+            id=str(r["id"]),
+            question=question,
+            gt_answer=str(r["ground_truth"]),
+            image_paths=image_paths,
+            task_type=str(r["question_type"]),
+            answer_format=answer_format,
+            annotations={},
+            raw={
+                "id": r["id"],
+                "dataset": str(r["dataset"]),
+                "scene_name": str(r["scene_name"]),
+                "question_type": str(r["question_type"]),
                 "options": list(options) if has_options else None,
             },
         )
@@ -508,4 +588,3 @@ class SPARDataLoader:
                 "format":    fmt,
             },
         )
-

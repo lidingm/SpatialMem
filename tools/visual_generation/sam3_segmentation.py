@@ -11,7 +11,9 @@ Follows the official SAM3 example notebook pattern:
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -29,10 +31,74 @@ DEFAULT_SAM3_CHECKPOINT = Path(os.environ.get(
 DEFAULT_BPE_PATH = DEFAULT_SAM3_REPO / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz"
 
 
+@contextlib.contextmanager
+def _quiet_sam3_output():
+    """Suppress verbose SAM3 import/model/tqdm output during batch runs."""
+    if os.environ.get("SPATIALMEM_QUIET_SAM3", "1") in {"0", "false", "False"}:
+        yield
+        return
+
+    previous_disable = logging.root.manager.disable
+    logging.disable(logging.WARNING)
+    with open(os.devnull, "w") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            try:
+                yield
+            finally:
+                logging.disable(previous_disable)
+
+
 def _ensure_sam3_importable(sam3_repo: Path) -> None:
     repo = str(sam3_repo)
     if repo not in sys.path:
         sys.path.insert(0, repo)
+
+
+def _norm_category_name(name) -> str:
+    return str(name or "").strip().lower()
+
+
+def count_tracks_for_category(ctx: dict, object_name: str) -> int:
+    """Count SAM3 tracks for one requested category from ToolRegistry context.
+
+    This reads `all_seg_results` and `seg_categories`, both produced by
+    `object_segmentation`. It is intentionally based on SAM3 tracking output,
+    not 3D merged instances: downstream geometry tools use this to decide
+    whether a required target was completely missed by SAM3.
+    """
+    target = _norm_category_name(object_name)
+    all_seg = ctx.get("all_seg_results") or {}
+    seg_cats = ctx.get("seg_categories") or {}
+    matched = False
+    track_keys: set[object] = set()
+    det_count = 0
+
+    for prompt, segs in all_seg.items():
+        prompt_n = _norm_category_name(prompt)
+        cat_n = _norm_category_name(seg_cats.get(prompt))
+        if target not in (prompt_n, cat_n):
+            continue
+        matched = True
+        for seg in segs:
+            scores = seg.get("scores", [])
+            det_count += len(scores)
+            obj_ids = seg.get("obj_ids")
+            if obj_ids is not None:
+                for oid in obj_ids:
+                    track_keys.add(oid)
+
+    if track_keys:
+        return len(track_keys)
+    return det_count if matched else 0
+
+
+def missing_tracked_categories(ctx: dict, object_names: Sequence[str]) -> list[str]:
+    """Return requested categories for which SAM3 produced zero tracks."""
+    missing: list[str] = []
+    for name in object_names:
+        if name and count_tracks_for_category(ctx, name) == 0:
+            missing.append(str(name))
+    return missing
 
 
 class SAM3SegmentationTool:
@@ -68,16 +134,17 @@ class SAM3SegmentationTool:
         torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
 
         self.device = device
-        self.model = build_sam3_image_model(
-            bpe_path=bpe,
-            device="cuda",
-            checkpoint_path=ckpt,
-            load_from_HF=False,
-        )
-        self.processor = Sam3Processor(
-            self.model,
-            confidence_threshold=confidence_threshold,
-        )
+        with _quiet_sam3_output():
+            self.model = build_sam3_image_model(
+                bpe_path=bpe,
+                device="cuda",
+                checkpoint_path=ckpt,
+                load_from_HF=False,
+            )
+            self.processor = Sam3Processor(
+                self.model,
+                confidence_threshold=confidence_threshold,
+            )
         self.confidence_threshold = confidence_threshold
         self._video_predictor = None  # lazy-initialised on first video call
 
@@ -94,13 +161,20 @@ class SAM3SegmentationTool:
         bpe = str(DEFAULT_BPE_PATH)
         ckpt = str(DEFAULT_SAM3_CHECKPOINT)
 
-        predictor = build_sam3_multiplex_video_predictor(
-            checkpoint_path=ckpt,
-            bpe_path=bpe,
-            compile=False,
-            warm_up=False,
-            async_loading_frames=False,
-        )
+        with _quiet_sam3_output():
+            predictor = build_sam3_multiplex_video_predictor(
+                checkpoint_path=ckpt,
+                bpe_path=bpe,
+                compile=False,
+                warm_up=False,
+                async_loading_frames=False,
+                # Remove the 16-object tracking cap. Past the cap SAM3 silently DROPS
+                # the lowest-scoring new detections ("hitting max_num_objects=16"), so
+                # crowded scenes can never be counted correctly. SAM3 itself treats
+                # <=0 as "no limit" (it substitutes 10000), so this is the sanctioned
+                # escape hatch. Costs memory/time roughly with the object count.
+                max_num_objects=-1,
+            )
         # --- instance-counting tuning ----------------------------------------
         # Moderately looser than the official defaults for recall, but pulled
         # back from the earlier fully-permissive values (which admitted too many
@@ -165,10 +239,11 @@ class SAM3SegmentationTool:
         orig_w, orig_h = pil_frames[0].size  # pixel dimensions
 
         # Start session
-        resp = predictor.handle_request({
-            "type": "start_session",
-            "resource_path": pil_frames,
-        })
+        with _quiet_sam3_output():
+            resp = predictor.handle_request({
+                "type": "start_session",
+                "resource_path": pil_frames,
+            })
         session_id = resp["session_id"]
 
         n_frames = len(pil_frames)
@@ -184,66 +259,72 @@ class SAM3SegmentationTool:
             # runs FA detection on EVERY frame during propagate_in_video, so this
             # single add_prompt is all that's needed — objects that first appear
             # on later frames are still detected and tracked.
-            resp = predictor.handle_request({
-                "type": "add_prompt",
-                "session_id": session_id,
-                "frame_index": 0,
-                "text": text_prompt,
-            })
-            n_det_frame0 = int(len(resp["outputs"]["out_obj_ids"]))
-            print(f"  [SAM3 video] add_prompt frame 0: {n_det_frame0} '{text_prompt}' detected")
+            with _quiet_sam3_output():
+                predictor.handle_request({
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": 0,
+                    "text": text_prompt,
+                })
 
             # Propagate across all frames, collecting per-frame instances.
             all_obj_ids: set[int] = set()
             per_frame: list[dict] = [None] * len(pil_frames)  # type: ignore
 
-            for out in predictor.handle_stream_request({
-                "type": "propagate_in_video",
-                "session_id": session_id,
-            }):
-                fi   = out["frame_index"]
-                outs = out["outputs"]
+            with _quiet_sam3_output():
+                for out in predictor.handle_stream_request({
+                    "type": "propagate_in_video",
+                    "session_id": session_id,
+                }):
+                    fi   = out["frame_index"]
+                    outs = out["outputs"]
 
-                # Outputs may be torch tensors or numpy arrays depending on the
-                # SAM3 code path — normalise to numpy either way.
-                def _np(x):
-                    return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
+                    # Outputs may be torch tensors or numpy arrays depending on the
+                    # SAM3 code path — normalise to numpy either way.
+                    def _np(x):
+                        return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
 
-                obj_ids = _np(outs["out_obj_ids"]).tolist()          # list[int]
-                scores  = _np(outs["out_probs"]).astype(np.float32)  # (N,)
+                    obj_ids = _np(outs["out_obj_ids"]).tolist()          # list[int]
+                    scores  = _np(outs["out_probs"]).astype(np.float32)  # (N,)
 
-                # Convert masks to numpy bool at original resolution
-                masks_np = _np(outs["out_binary_masks"]).astype(bool)  # (N, H_model, W_model)
+                    # Convert masks to numpy bool at original resolution
+                    masks_np = _np(outs["out_binary_masks"]).astype(bool)  # (N, H_model, W_model)
 
-                # Convert normalised xywh → xyxy pixel coords
-                if len(obj_ids) > 0:
-                    bx = _np(outs["out_boxes_xywh"]).astype(np.float32)  # (N,4) xywh normed
-                    cx = (bx[:, 0] + bx[:, 2] / 2) * orig_w
-                    cy = (bx[:, 1] + bx[:, 3] / 2) * orig_h
-                    hw = bx[:, 2] * orig_w / 2
-                    hh = bx[:, 3] * orig_h / 2
-                    boxes_xyxy = np.stack(
-                        [cx - hw, cy - hh, cx + hw, cy + hh], axis=1
-                    )
-                else:
-                    boxes_xyxy = np.empty((0, 4), dtype=np.float32)
+                    # Convert normalised xywh → xyxy pixel coords
+                    if len(obj_ids) > 0:
+                        bx = _np(outs["out_boxes_xywh"]).astype(np.float32)  # (N,4) xywh normed
+                        cx = (bx[:, 0] + bx[:, 2] / 2) * orig_w
+                        cy = (bx[:, 1] + bx[:, 3] / 2) * orig_h
+                        hw = bx[:, 2] * orig_w / 2
+                        hh = bx[:, 3] * orig_h / 2
+                        boxes_xyxy = np.stack(
+                            [cx - hw, cy - hh, cx + hw, cy + hh], axis=1
+                        )
+                    else:
+                        boxes_xyxy = np.empty((0, 4), dtype=np.float32)
 
-                all_obj_ids.update(obj_ids)
-                per_frame[fi] = {
-                    "obj_ids": obj_ids,
-                    "masks":   masks_np,
-                    "boxes":   boxes_xyxy,
-                    "scores":  scores,
-                }
+                    all_obj_ids.update(obj_ids)
+                    per_frame[fi] = {
+                        "obj_ids": obj_ids,
+                        "masks":   masks_np,
+                        "boxes":   boxes_xyxy,
+                        "scores":  scores,
+                    }
 
             # Fill any frames that received no output (no objects visible)
             per_frame = [f if f is not None else empty_frame for f in per_frame]
 
         finally:
-            predictor.handle_request({
-                "type": "close_session",
-                "session_id": session_id,
-            })
+            with _quiet_sam3_output():
+                predictor.handle_request({
+                    "type": "close_session",
+                    "session_id": session_id,
+                    # SAM3 calls torch.cuda.empty_cache() on close once device usage
+                    # crosses this percentage (its default is 80). Handing the cached
+                    # blocks back forces a CUDA sync and makes the next call re-acquire
+                    # them, so keep them until the device is genuinely near full.
+                    "clear_cache_threshold": 95,
+                })
 
         unique_ids = sorted(all_obj_ids)
         return {
@@ -273,9 +354,10 @@ class SAM3SegmentationTool:
         if isinstance(image, (str, Path)):
             image = Image.open(image).convert("RGB")
 
-        state = self.processor.set_image(image)
-        self.processor.reset_all_prompts(state)
-        state = self.processor.set_text_prompt(state=state, prompt=text_prompt)
+        with _quiet_sam3_output():
+            state = self.processor.set_image(image)
+            self.processor.reset_all_prompts(state)
+            state = self.processor.set_text_prompt(state=state, prompt=text_prompt)
 
         masks_tensor = state.get("masks")
         boxes_tensor = state.get("boxes")
