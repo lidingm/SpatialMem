@@ -38,7 +38,10 @@ Guidelines:
 - Populate params by inspecting the accumulated evidence and the original question.
 - For `distance_computation`, `direction_computation`, and `object_size_computation`, prefer object-name params (`obj_a`, `obj_b`, `object_name`, `viewpoint_target`, `reference_target`, `target_target`, `facing_target`). The tool layer will call Checker and resolve the intended track/instance.
 - Use concrete integer instance IDs only if the accumulated evidence makes that ID unambiguous. Never pass placeholder strings such as `<id_of_chair>`, `chair_instance_id`, or `"id_of_chair"`.
-- For camera-relative questions, pick the right `frame_index`; for "standing by X" / "facing Y" questions, use `viewpoint_type="object"` with `viewpoint_target="X"` and `facing_target="Y"`.
+- For camera-relative questions, pick the right `frame_index`.
+- For direction questions, use the same templates as the Planner:
+  - Egocentric / "my" direction: "standing by X facing Y, is Z to my left/right/front-left/..." -> `reference_target="X"`, `target_target="Z"`, `viewpoint_type="object"`, `viewpoint_target="X"`, `facing_target="Y"`.
+  - Object-relative direction: "standing by A facing B, is Z to the left/right/front/back of Y" -> `reference_target="Y"`, `target_target="Z"`, `viewpoint_type="object"`, `viewpoint_target="A"`, `facing_target="B"`.
 - For `object_segmentation`, the `text_prompt` should be as specific as needed to disambiguate but as terse as possible when counting all instances of a category.
 - For `distance_computation`, `direction_computation`, and `object_size_computation`, only invoke after `instance_3d_localization` has produced usable `obj_id_list`.
 """

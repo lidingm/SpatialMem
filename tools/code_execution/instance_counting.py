@@ -2,7 +2,7 @@
 optionally calibrated by a VLM reviewing the annotated frames.
 
 The calibration deliberately does NOT ask the model for a final count — it only
-reports structured, high-confidence corrections (missed / spurious / merge /
+reports structured corrections (missed / spurious / merge /
 split) and the count is derived from them here. That keeps the arithmetic
 deterministic and auditable.
 """
@@ -21,7 +21,6 @@ def count_unique_instances(
     llm=None,
     object_name: str | None = None,
     memory=None,
-    conf_threshold: float = 0.7,
     checker_notes: str | None = None,
 ) -> dict:
     """Count unique instances from 3D localization results (after clustering).
@@ -47,7 +46,7 @@ def count_unique_instances(
     if llm is not None and object_name and frames and instances is not None:
         from agent.checker import Checker
         cal = Checker(llm, memory=memory, checker_notes=checker_notes).calibrate_count(
-            object_name, results_3d, conf_threshold=conf_threshold)
+            object_name, results_3d)
         result["calibration"] = cal
         if cal.get("error") is None:
             result["total_unique"] = cal["adjusted_count"]
@@ -81,18 +80,27 @@ def apply_corrections_to_instances(instances: list[dict], cal: dict,
       missed   -> a box-less placeholder is appended (we only know the frames)
     """
     resp = cal.get("raw") or {}
-    conf = cal.get("_conf_threshold", 0.7)
     by_id = {int(it["id"]): dict(it) for it in instances}
     kept = set(cal.get("kept_ids") or [])
     out: list[dict] = []
     consumed: set[int] = set()
+    frames_by_id = {
+        oid: {int(f) for f in (it.get("frames") or [])}
+        for oid, it in by_id.items()
+    }
+
+    def _cooccurs(group: list[int]) -> bool:
+        for i, a in enumerate(group):
+            for b in group[i + 1:]:
+                if frames_by_id.get(a, set()) & frames_by_id.get(b, set()):
+                    return True
+        return False
+
 
     # merge — union the group's boxes/frames into the surviving instance
     for m in (resp.get("merge") or []):
-        if float(m.get("confidence", 0)) < conf:
-            continue
         grp = sorted({int(x) - 1 for x in (m.get("instances") or [])} & set(by_id))
-        if len(grp) < 2:
+        if len(grp) < 2 or _cooccurs(grp):
             continue
         keep_id = grp[0]
         if keep_id not in kept:
@@ -109,25 +117,17 @@ def apply_corrections_to_instances(instances: list[dict], cal: dict,
         out.append(base)
         consumed.add(keep_id)
 
-    # split — partition the boxes by the VLM's frame groups
+    # split: partition boxes only when frame groups form a valid partition
+    from agent.checker import validate_count_split
     for s in (resp.get("split") or []):
-        if float(s.get("confidence", 0)) < conf:
+        ok, _, parsed = validate_count_split(s, frames_by_id, allowed_ids=kept - consumed)
+        if not ok:
             continue
-        gid = int(s.get("instance", 0)) - 1
-        if gid not in by_id or gid in consumed or gid not in kept:
-            continue
+        gid = int(parsed["instance_id"])
         base = by_id[gid]
-        groups = [g for g in (s.get("target_frame_groups") or []) if g]
-        non_target = set(int(f) for f in (s.get("non_target_frames") or []))
-        if not groups:
-            flagged = dict(base)
-            flagged["split_unresolved"] = int(s.get("n_target", 2))
-            out.append(flagged)
-            consumed.add(gid)
-            continue
         all_boxes = list(base.get("boxes_2d") or [])
-        for gi, frames_g in enumerate(groups, start=1):
-            fset = {int(f) for f in frames_g} - non_target
+        for gi, frames_g in enumerate(parsed["target_frame_groups"], start=1):
+            fset = set(int(f) for f in frames_g)
             piece = dict(base)
             piece["boxes_2d"] = [b for b in all_boxes if int(b["frame"]) in fset]
             piece["frames"] = sorted(fset)
@@ -135,7 +135,6 @@ def apply_corrections_to_instances(instances: list[dict], cal: dict,
             piece["split_from"] = base["id"] + 1
             out.append(piece)
         consumed.add(gid)
-
     # untouched survivors
     for oid in sorted(kept):
         if oid not in consumed and oid in by_id:
@@ -146,8 +145,6 @@ def apply_corrections_to_instances(instances: list[dict], cal: dict,
     # stay in step and the reflector can see what was claimed to be missing.
     n_next = 1
     for mm in (resp.get("missed") or []):
-        if float(mm.get("confidence", 0)) < conf:
-            continue
         out.append({
             "label": f"{object_name} (missed {n_next})",
             "category": object_name,

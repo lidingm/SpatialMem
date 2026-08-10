@@ -140,12 +140,16 @@ def compute_relative_direction(
     else:
         fb_label = "back"
 
-    parts = []
-    if lr_label != "center":
-        parts.append(lr_label)
-    if fb_label != "center":
-        parts.append(fb_label)
-    direction = "-".join(parts) if parts else "same position"
+    # Use VSI-Bench option wording for quadrant labels:
+    # front-left/front-right/back-left/back-right.
+    if fb_label != "center" and lr_label != "center":
+        direction = f"{fb_label}-{lr_label}"
+    elif fb_label != "center":
+        direction = fb_label
+    elif lr_label != "center":
+        direction = lr_label
+    else:
+        direction = "same position"
 
     return {
         "direction": direction,

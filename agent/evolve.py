@@ -36,6 +36,15 @@ from agent.skill_lib import SkillLib, Skill
 
 # ─── Entry point ──────────────────────────────────────────────────────
 
+def _record_distilled_skill(updates: dict, skill_lib: SkillLib, name: str | None) -> None:
+    """Classify distill_new_skill result as new pending skill or existing-skill update."""
+    if not name:
+        return
+    if (skill_lib.pending_dir / name).exists():
+        updates["pending_saved"] = name
+    else:
+        updates["skill_updates"].append(f"{name}:when_to_use")
+
 def evolve_after_sample(
     result: AgentResult,
     sample,
@@ -60,7 +69,7 @@ def evolve_after_sample(
     updates: dict = {"path": None, "skill_updates": [], "memory_updates": [],
                      "pending_saved": None, "bootstrapped": None}
 
-    # Always log samples where no SKILL was chosen — feeds category bootstrap.
+    # Always log samples where no SKILL was chosen; this feeds category bootstrap.
     if not result.chosen_skill:
         _log_uncovered_category(sample, result, memory.root / "category_trajectories")
 
@@ -82,9 +91,8 @@ def evolve_after_sample(
         # Only distill a new SKILL if the trajectory involved multiple tools
         # (single-tool "trajectories" are not worth encoding as a SKILL).
         if len(trajectory["tool_calls"]) >= 2:
-            pending = distill_new_skill(sample, trajectory, llm, skill_lib, verbose=verbose)
-            if pending is not None:
-                updates["pending_saved"] = pending
+            distilled = distill_new_skill(sample, trajectory, llm, skill_lib, verbose=verbose)
+            _record_distilled_skill(updates, skill_lib, distilled)
         _update_memory_from_tools(orchestrator.tools.context, memory, sample, updates)
 
     elif not result.success and result.skills_used:
@@ -121,6 +129,12 @@ def evolve_after_sample(
                     if skill_lib.append_checker_note(name, checker_text):
                         skill_lib.bump_version(name)
                         updates["skill_updates"].append(f"{name}:checker")
+
+            corrected_traj = _summarize_trajectory(corrected_result)
+            corrected_traj["reconstructed_from_wrong"] = True
+            corrected_traj["failed_chosen_skill"] = result.chosen_skill
+            distilled = distill_new_skill(sample, corrected_traj, llm, skill_lib, verbose=verbose)
+            _record_distilled_skill(updates, skill_lib, distilled)
         else:
             memory.record_unsolved(
                 sample.id, sample.task_type,
@@ -141,9 +155,8 @@ def evolve_after_sample(
             corrected_plan, corrected_result, _ = corrected
             corrected_traj = _summarize_trajectory(corrected_result)
             corrected_traj["reconstructed_from_wrong"] = True
-            pending = distill_new_skill(sample, corrected_traj, llm, skill_lib, verbose=verbose)
-            if pending is not None:
-                updates["pending_saved"] = pending
+            distilled = distill_new_skill(sample, corrected_traj, llm, skill_lib, verbose=verbose)
+            _record_distilled_skill(updates, skill_lib, distilled)
         else:
             memory.record_unsolved(
                 sample.id, sample.task_type,
@@ -167,6 +180,25 @@ def evolve_after_sample(
 
 # ─── Reflect-and-verify helper ────────────────────────────────────────
 
+def _print_reconstruct_tool_details(verify: AgentResult) -> None:
+    """Print the concrete tool execution trace from a reconstructed rerun."""
+    calls = list(verify.tool_calls or [])
+    if not calls:
+        print("[RECONSTRUCT TOOL CALLS] none")
+        return
+
+    for idx, tc in enumerate(calls, start=1):
+        status = "OK" if tc.get("success") else "FAIL"
+        tool = tc.get("tool_name", "?")
+        params = tc.get("params", {})
+        print(f"[RECONSTRUCT TOOL {idx:02d}] {status} {tool} params={params}")
+        detail = tc.get("result_summary") if tc.get("success") else tc.get("error")
+        detail = str(detail or "").strip()
+        if detail:
+            for line in detail.splitlines():
+                print(f"     {line}")
+
+
 def _reflect_and_verify(sample, result, reflector, orchestrator,
                         evaluate_answer, tool_descriptions,
                         verbose: bool):
@@ -184,6 +216,7 @@ def _reflect_and_verify(sample, result, reflector, orchestrator,
         print(f"[RECONSTRUCT] attempt {attempt+1}  diagnosis: {rc.get('diagnosis', '(none)')}")
         print(f"[RECONSTRUCT] new plan: {plan_str}")
         verify = orchestrator.run_with_plan(sample, corrected_plan)
+        _print_reconstruct_tool_details(verify)
         verify.success = evaluate_answer(
             verify.predicted_answer, sample.gt_answer,
             sample.answer_format, sample.task_type)
@@ -195,6 +228,31 @@ def _reflect_and_verify(sample, result, reflector, orchestrator,
 
 
 # ─── LLM-driven distillation ──────────────────────────────────────────
+
+def _structured_ctx_reference() -> str:
+    """Runtime ctx fields that generated SKILL code may read after tools run."""
+    return """Structured runtime ctx reference for execute_py_body:
+- Do NOT parse human-readable result_summary text when a structured ctx field exists.
+  Tool calls mutate the shared `ctx` dict; SKILL code may read these fields after the corresponding tool succeeds.
+- `distance_computation` overwrites `ctx["distance"]` on each successful call:
+  - object-object: `{mode: "object_to_object", meters, a, b, a_id, b_id, a_frames, b_frames, checker}`.
+  - object-camera: `{mode: "object_to_camera", meters, a, b: "camera@<frame>", obj_id, a_frames, checker}`.
+  - If looping over candidates, call `ctx.pop("distance", None)` before each distance call so a failed/no-distance case cannot reuse the previous candidate's value.
+- `direction_computation` overwrites `ctx["direction"]` on each successful call:
+  - `{direction, lr_label, fb_label, lr_angle_deg, fb_angle_deg, angle_from_forward_deg, distance_ref_to_target, viewpoint, reference, target, facing, checker}`.
+  - Use `direction` for option text such as `front-left`; use angles only when the task asks for thresholds or tie-breaking.
+- `object_size_computation` writes `ctx["object_size"]`:
+  - `{object, instance_id, dimension, dimension_label, value, unit, size_xyz_m, bbox_volume_m3, frames_used, checker}`.
+  - `size_xyz_m` is `[width_x, height_y, depth_z]` in meters; use `value/unit` for the requested dimension.
+- `scene_size_computation` writes `ctx["scene_size"]`:
+  - `{extent_xyz, bbox_min, bbox_max, floor_area, height, n_points_raw, n_points_clean}`.
+  - Use `floor_area` for room-area answers; `extent_xyz` gives width/height/depth-like extents.
+- Checker-backed distance/direction/object-size tools may write `ctx["final_localizations"]`:
+  - keys are normalized object names; values include `object`, `instance_id`, `instance_label`, `keep_frames`, `dropped_frames`, and `reason`.
+  - Use this only when a derived task needs to know which checked instance/frames were used.
+- When a SKILL computes a derived task result, store it in a clear ctx key such as `ctx["closest_candidate_result"]` or `ctx["route_planning_result"]`, and append a concise human-readable line to `ctx.setdefault("skill_summaries", []).append(evidence_text)` so Reflector/Finalizer can see it.
+"""
+
 
 def distill_success(skill: Skill, skill_lib: SkillLib, llm: LLMClient,
                     window: int = DISTILL_WINDOW, verbose: bool = False) -> bool:
@@ -259,6 +317,8 @@ def distill_new_skill(sample, trajectory: dict, llm: LLMClient,
 
     prompt = f"""You are reviewing a successful trajectory to decide whether to update an existing SKILL or create a new one.
 
+This Path-B trajectory is a successful raw-tool trajectory with no SKILL selected. Use it to decide whether the strategy should become a new SKILL or update an existing one.
+
 Sample question type: {sample.task_type}
 Task category: {sample.task_category}
 Question: {sample.question[:400]}
@@ -290,6 +350,8 @@ For action="create", output JSON:
     "tool_sequence": ["tool1", "tool2", ...],
     "execute_py_body": "<see contract below>"
 }}
+
+{_structured_ctx_reference()}
 
 Contract for `execute_py_body` — READ CAREFULLY:
 
@@ -671,6 +733,8 @@ Output JSON:
     "execute_py_body": "<see contract>"
 }}
 
+{_structured_ctx_reference()}
+
 Contract for `execute_py_body`:
 1. Output ONLY the function body — no `def execute(...):` line.
 2. Tool API returns a DICT with keys `success/tool_name/params/result_summary/error`. Access via `r["success"]`. It is NOT a tuple.
@@ -746,7 +810,7 @@ If you cannot design a coherent SKILL for this category (e.g., tools do not supp
 # ─── Bookkeeping helpers ──────────────────────────────────────────────
 
 def _summarize_trajectory(result: AgentResult) -> dict:
-    # Best-effort read of skill_params from the plan (Planner output).
+    # Best-effort read of skill_params from the plan.
     skill_params = None
     if isinstance(result.plan, dict):
         skill_params = result.plan.get("skill_params")
@@ -756,6 +820,7 @@ def _summarize_trajectory(result: AgentResult) -> dict:
         "task_category": result.task_category,
         "chosen_skill": result.chosen_skill,
         "skill_params": skill_params,
+        "trajectory_source": "raw_tool" if not result.skills_used else "skill_only",
         "success": bool(result.success),
         "predicted": result.predicted_answer,
         "gt": result.gt_answer,

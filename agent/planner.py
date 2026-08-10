@@ -105,7 +105,10 @@ Category assignment rules:
 Raw-tool parameter rules:
 - For distance_computation, direction_computation, and object_size_computation, prefer object-name parameters from the question, such as `obj_a`, `obj_b`, `object_name`, `viewpoint_target`, `reference_target`, `target_target`, and `facing_target`. The tool layer will call Checker and resolve the final instance.
 - Never invent placeholder IDs like "<id_of_chair>" or "chair_instance_id". Use integer IDs only when a previous context explicitly contains an unambiguous concrete ID.
-- For direction questions, if the question says "standing by X" or "from X", set `viewpoint_type="object"` and `viewpoint_target="X"`. If it says "facing Y", set `facing_target="Y"`.
+- For direction questions, fill both `skill_params` and any `direction_computation` step from one of these templates:
+  - Egocentric / "my" direction: "standing by X facing Y, is Z to my left/right/front-left/..." -> `reference_target="X"`, `target_target="Z"`, `viewpoint_type="object"`, `viewpoint_target="X"`, `facing_target="Y"`. Do not omit `viewpoint_target` or `facing_target` when stated.
+  - Object-relative direction: "standing by A facing B, is Z to the left/right/front/back of Y" -> `reference_target="Y"`, `target_target="Z"`, `viewpoint_type="object"`, `viewpoint_target="A"`, `facing_target="B"`. If no facing phrase exists, omit `facing_target`; if no standing/from object exists, use `viewpoint_type="camera"`.
+  - Never put the facing object into `reference_target` for a "to my ..." question.
 - For object_segmentation, SAM3 tracks instances across video frames; use short plain object nouns so those tracks are stable.
 
 === Object Categories ===

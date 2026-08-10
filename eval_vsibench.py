@@ -52,7 +52,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 os.environ.setdefault("LLM_BASE_URL",  "http://10.130.138.46:8010/v1")
-os.environ.setdefault("LLM_API_KEY",   "sk-ZAJy47c5eid1MW_wjx7Fpg")
+os.environ.setdefault("LLM_API_KEY",   "EMPTY")
 os.environ.setdefault("LLM_MODEL",     "qwen3.6-plus")
 os.environ.setdefault("SAM3_REPO",     "/home/zhouruofan/Training-Free/tool_model/sam3")
 os.environ.setdefault("SAM3_CHECKPOINT", "/home/zhouruofan/Training-Free/tool_model/sam3.1/sam3.1_multiplex.pt")
@@ -481,7 +481,6 @@ def main():
                     summary_text = ""
                     if result is not None:
                         summary_text = str(getattr(result, "final_context", "") or "")
-                    stages = collect_stages(tools)
                     options = sample.raw.get("options")
                     score = score_sample(pred, sample.gt_answer, sample.answer_format, options)
                     per_type_scores[qt].append(score)
@@ -497,7 +496,6 @@ def main():
                     print(f">>> {metric_name}={score:.3f}  pred={pred!r} gt={sample.gt_answer!r}")
                     if summary_text:
                         print(summary_text)
-                    print_stages(stages)
                     if (i + 1) % PRINT_EVERY == 0:
                         cur = per_type_scores[qt]
                         print(f"  ↳ [{qt}] running {metric_name}={sum(cur)/len(cur):.3f} "

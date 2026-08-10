@@ -735,6 +735,7 @@ def draw_final_localization_annotations(
     frame_paths: Sequence[str],
     final_locs: dict[str, dict],
     output_dir: str | Path,
+    geometry_by_id: dict[int, dict] | None = None,
 ) -> dict:
     """Draw the Checker-validated final target localization on one 32-frame set.
 
@@ -758,6 +759,7 @@ def draw_final_localization_annotations(
 
     instances = results_3d.get("instances") or []
     by_id = {int(it["id"]): it for it in instances if "id" in it}
+    geometry_by_id = geometry_by_id or {}
     selected: list[dict] = []
     for idx, (name, loc) in enumerate(final_locs.items()):
         if loc is None or loc.get("instance_id") is None:
@@ -767,6 +769,9 @@ def draw_final_localization_annotations(
         if inst is None:
             continue
         keep = {int(f) for f in (loc.get("keep_frames") or inst.get("frames") or [])}
+        geom = geometry_by_id.get(oid) or {}
+        center = geom.get("avg_pos") if geom else inst.get("center_3d_m")
+        bbox_size = geom.get("bbox_size") if geom else inst.get("bbox_size_m")
         color_name, color = _PALETTE[idx % len(_PALETTE)]
         label = str(loc.get("instance_label") or inst.get("label") or name)
         selected.append({
@@ -777,8 +782,8 @@ def draw_final_localization_annotations(
             "keep_frames": sorted(keep),
             "dropped_frames": list(loc.get("dropped_frames") or []),
             "reason": str(loc.get("reason") or ""),
-            "center_3d_m": inst.get("center_3d_m"),
-            "bbox_size_m": inst.get("bbox_size_m"),
+            "center_3d_m": [round(float(v), 3) for v in center] if center is not None else None,
+            "bbox_size_m": [round(float(v), 3) for v in bbox_size] if bbox_size is not None else None,
             "boxes_2d": [b for b in inst.get("boxes_2d", [])
                          if int(b.get("frame", -1)) in keep],
             "_rgb": color,

@@ -127,10 +127,11 @@ def instance_geometry(
     ctx: dict,
     obj_id: int,
     frames: list[int] | None = None,
+    dejitter: bool = True,
 ) -> dict:
     """Recompute one object's 3D geometry, optionally using Checker-kept frames."""
     frame_key = None if frames is None else tuple(sorted(int(f) for f in frames))
-    cache_key = (int(obj_id), frame_key)
+    cache_key = (int(obj_id), frame_key, bool(dejitter))
     geom_cache = ctx.setdefault("instance_geometry_cache", {})
     if cache_key in geom_cache:
         return geom_cache[cache_key]
@@ -144,7 +145,7 @@ def instance_geometry(
     if seg is not None and f2g is not None:
         g = back_project_instance(
             seg, da3["depth"], da3["intrinsics"], da3["extrinsics"],
-            int(obj_id), f2g, frames=frames,
+            int(obj_id), f2g, frames=frames, dejitter=dejitter,
         )
         if g is not None:
             geom_cache[cache_key] = g
@@ -217,11 +218,20 @@ def _render_final_localizations(ctx: dict) -> None:
         from tools.code_execution.instance_3d_localization import (
             draw_final_localization_annotations,
         )
+        geometry_by_id = {}
+        for loc in final_locs.values():
+            if loc is None or loc.get("instance_id") is None:
+                continue
+            oid = int(loc["instance_id"])
+            geom = instance_geometry(ctx, oid, loc.get("keep_frames"), dejitter=False)
+            if geom is not None:
+                geometry_by_id[oid] = geom
         meta = draw_final_localization_annotations(
             r3d,
             frame_paths,
             final_locs,
             Path(output_root) / "spatial" / "final_localization",
+            geometry_by_id=geometry_by_id,
         )
         ctx["final_localization_annotations"] = meta
     except Exception as e:  # noqa: BLE001 - visualization must not break geometry
@@ -246,6 +256,7 @@ def run_distance_task(
     frame_paths: list[str],
 ) -> dict:
     """Formal distance workflow with Checker-based target validation."""
+    ctx.pop("distance", None)
     r3d = ctx.get("results_3d")
     da3 = ctx.get("da3_result")
     if r3d is None:

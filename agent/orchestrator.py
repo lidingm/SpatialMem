@@ -38,6 +38,67 @@ KNOWN_TOOLS = frozenset([
 ])
 
 
+_DIRECTION_SKILL_PARAM_KEYS = {
+    "viewpoint_type", "viewpoint_target", "viewpoint_frame",
+    "reference_target", "target_target", "facing_target",
+}
+
+
+def _fill_skill_params_from_plan(chosen_skill: str | None,
+                                 skill_params: dict,
+                                 plan_steps: list[dict]) -> dict:
+    """Use the concrete planned tool call to repair incomplete skill params.
+
+    Planner sometimes fills the human-readable raw-tool plan correctly but leaves
+    `skill_params` incomplete. The skill invocation only sees `skill_params`, so
+    copy direction parameters from the planned `direction_computation` step before
+    executing judge_direction.
+    """
+    params = dict(skill_params or {})
+    if chosen_skill != "judge_direction":
+        return params
+    for step in plan_steps or []:
+        if step.get("tool") != "direction_computation":
+            continue
+        step_params = step.get("params") or {}
+        for key in _DIRECTION_SKILL_PARAM_KEYS:
+            value = step_params.get(key)
+            if value not in (None, "", "null"):
+                params[key] = value
+        break
+    return params
+
+
+def _object_names_from_plan(plan: dict) -> list[str]:
+    """Extract explicit Planner/skill target names, avoiding broad question regexes."""
+    names: list[str] = []
+
+    def add(value: Any) -> None:
+        if value in (None, "", "null"):
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add(item)
+            return
+        if not isinstance(value, str):
+            return
+        name = value.strip().lower()
+        if name and name not in names:
+            names.append(name)
+
+    add((plan or {}).get("object_targets") or [])
+    param_sources = [((plan or {}).get("skill_params") or {})]
+    param_sources.extend((step.get("params") or {}) for step in ((plan or {}).get("plan") or []))
+    for params in param_sources:
+        for key in (
+            "object_name", "object_category", "text_prompt", "target", "obj",
+            "obj_a", "obj_b", "reference_target", "target_target",
+            "viewpoint_target", "facing_target",
+        ):
+            add(params.get(key))
+    return names
+
+
 @dataclass
 class AgentResult:
     sample_id: str
@@ -72,6 +133,7 @@ class Orchestrator:
         max_rounds: int = MAX_ROUNDS,
         confidence_threshold: float = CONFIDENCE_THRESHOLD,
         verbose: bool = True,
+        allow_post_skill_reflection: bool = True,
     ):
         self.tools = tools
         self.memory = memory
@@ -82,6 +144,7 @@ class Orchestrator:
         self.max_rounds = max_rounds
         self.confidence_threshold = confidence_threshold
         self.verbose = verbose
+        self.allow_post_skill_reflection = allow_post_skill_reflection
 
     # ─── Public entry points ──────────────────────────────────────────
 
@@ -104,6 +167,8 @@ class Orchestrator:
             sample, memory_ctx, retrieved, self.tools.tool_descriptions,
             image_paths=self.tools.context.get("frame_paths"))
         chosen_skill_name = plan.get("chosen_skill") or None
+        plan["skill_params"] = _fill_skill_params_from_plan(
+            chosen_skill_name, plan.get("skill_params", {}) or {}, plan.get("plan", []))
         # Cache Planner-inferred scene_type in tool context so evolve.py can
         # bucket scene_scale_prior updates under the right key (bedroom, kitchen, ...)
         # instead of everything collapsing into "indoor_room".
@@ -136,39 +201,72 @@ class Orchestrator:
                 params = plan.get("skill_params", {}) or {}
                 checker_notes = skill.sections.get("Checker", "").strip()
                 self.tools.set_checker_notes(checker_notes)
+                self.tools.append_context_text(
+                    f"Round {self._ordered_round_count() + 1}: selected skill[{skill.name}]")
+                num_rounds = 1
+                prev_skill_summary_len = len(self.tools.context.get("skill_summaries", []))
                 try:
                     inv = self.skill_lib.invoke(skill, sample, self.tools,
                                                 self.tools.context, params)
+                    self._append_new_skill_summaries(prev_skill_summary_len)
+                    prev_skill_summary_len = len(self.tools.context.get("skill_summaries", []))
                     if not inv.get("success", True):
-                        # SKILL returned success=False — fall back to raw-tool loop.
-                        # Do NOT add to skills_used: evolve should treat this as a
-                        # raw-tool trajectory (Path B/D), not a SKILL success (Path A).
-                        if self.verbose:
-                            print(f"[SKILL:{skill.name}] returned failure: "
-                                  f"{inv.get('summary', '')}; falling back to raw-tool loop")
-                        self.tools.set_checker_notes("")
-                        num_rounds = self._raw_tool_loop(sample, plan)
+                        summary = str(inv.get("summary", "")).strip() or "skill returned success=False"
+                        self.tools.append_context_note(f"skill:{skill.name}", f"FAILED: {summary}")
+                        if self.allow_post_skill_reflection:
+                            # Evaluation/notebook mode: recover with raw tools after a failed skill.
+                            if self.verbose:
+                                print(f"[SKILL:{skill.name}] returned failure: "
+                                      f"{summary}; falling back to raw-tool loop")
+                            self.tools.set_checker_notes("")
+                            num_rounds += self._raw_tool_loop(
+                                sample, plan, max_rounds=max(0, self.max_rounds - num_rounds))
+                        else:
+                            # Training mode: keep the failed skill trajectory pure for Path C.
+                            skills_used.append(skill.name)
+                            if self.verbose:
+                                print(f"[SKILL:{skill.name}] returned failure: {summary}; "
+                                      "post-skill recovery disabled")
                     else:
                         skills_used.append(skill.name)
-                        num_rounds = 1
                         if self.verbose:
                             print(f"[SKILL:{skill.name}] {inv.get('summary', '')}")
+                        if self.allow_post_skill_reflection:
+                            reflection = self._reflect_after_round(sample, plan)
+                            if not self._should_terminate(reflection):
+                                followup_plan = self._plan_from_next_actions(reflection)
+                                if followup_plan.get("plan"):
+                                    plan["post_skill_plan"] = followup_plan["plan"]
+                                    self.tools.set_checker_notes("")
+                                    num_rounds += self._raw_tool_loop(
+                                        sample, followup_plan,
+                                        max_rounds=max(0, self.max_rounds - num_rounds))
                 except Exception as e:
+                    self._append_new_skill_summaries(prev_skill_summary_len)
+                    self.tools.append_context_note(f"skill:{skill.name}", f"FAILED: {e}")
                     if self.verbose:
-                        print(f"[SKILL:{skill.name}] raised: {e!r}; "
-                              f"falling back to raw-tool loop")
-                    # Exception path: also do NOT add to skills_used, same reason.
+                        suffix = ("falling back to raw-tool loop" if self.allow_post_skill_reflection
+                                  else "post-skill recovery disabled")
+                        print(f"[SKILL:{skill.name}] raised: {e!r}; {suffix}")
                     self.tools._tool_log.append({
                         "tool_name": f"skill:{skill.name}",
                         "params": params, "success": False,
                         "result_summary": "", "error": str(e),
                     })
-                    self.tools.set_checker_notes("")
-                    num_rounds = self._raw_tool_loop(sample, plan)
+                    if self.allow_post_skill_reflection:
+                        self.tools.set_checker_notes("")
+                        num_rounds += self._raw_tool_loop(
+                            sample, plan, max_rounds=max(0, self.max_rounds - num_rounds))
+                    else:
+                        # Training mode: mark this as an attempted SKILL so evolve uses Path C.
+                        skills_used.append(skill.name)
         else:
             self.tools.set_checker_notes("")
             num_rounds = self._raw_tool_loop(sample, plan)
 
+        plan_object_names = _object_names_from_plan(plan) or sample.object_names
+        self.tools.append_task_prior_context(
+            sample.task_type, sample.task_category, object_names=plan_object_names)
         ctx_summary = self.tools.get_context_summary()
 
         # Finalizer 阶段：重建 memory_ctx，用工具执行期间真实存储的 seg_categories
@@ -180,7 +278,7 @@ class Orchestrator:
         final_memory_ctx = self.memory.format_context(
             sample.task_category,
             object_categories=seg_cats or None,
-            object_names=sample.object_names if not seg_cats else None,
+            object_names=plan_object_names if not seg_cats else None,
             scene_type=final_scene_type or None,
         )
         final = self.reflector.finalize(
@@ -224,6 +322,9 @@ class Orchestrator:
         for step in plan["plan"]:
             self.tools.execute_tool(step["tool"], step.get("params", {}), frame_paths)
 
+        plan_object_names = _object_names_from_plan(plan) or sample.object_names
+        self.tools.append_task_prior_context(
+            sample.task_type, sample.task_category, object_names=plan_object_names)
         ctx_summary = self.tools.get_context_summary()
         # run_with_plan 也用 seg_categories 查先验（和 run() 保持一致）
         seg_cats = list(dict.fromkeys(
@@ -233,7 +334,7 @@ class Orchestrator:
         final_memory_ctx = self.memory.format_context(
             sample.task_category,
             object_categories=seg_cats or None,
-            object_names=sample.object_names if not seg_cats else None,
+            object_names=plan_object_names if not seg_cats else None,
             scene_type=final_scene_type or None,
         )
         final = self.reflector.finalize(
@@ -281,12 +382,75 @@ class Orchestrator:
         self.tools.context["task_type"] = sample.task_type
         self.tools.context["task_category"] = sample.task_category
 
-    def _raw_tool_loop(self, sample: SpatialSample, plan: dict) -> int:
-        """Run the fallback raw-tool plan; return number of rounds executed."""
+    def _ordered_round_count(self) -> int:
+        return sum(
+            1 for item in self.tools.context.get("ordered_context", [])
+            if str(item).strip().startswith("Round ")
+        )
+
+    def _append_new_skill_summaries(self, prev_len: int) -> None:
+        for s in self.tools.context.get("skill_summaries", [])[prev_len:]:
+            if s:
+                self.tools.append_context_text(str(s))
+
+    def _append_reflection_context(self, reflection: dict) -> None:
+        refl_lines = [
+            f"confidence={float(reflection.get('confidence', 0.0)):.2f}, "
+            f"decision={reflection.get('decision', '')}"
+        ]
+        reason = str(reflection.get("confidence_reasoning", "")).strip()
+        if reason:
+            refl_lines.append(f"  reason={reason}")
+        gaps = reflection.get("evidence_gaps") or []
+        if gaps:
+            refl_lines.append(f"  evidence_gaps={gaps}")
+        next_actions_raw = reflection.get("next_actions", [])
+        if next_actions_raw:
+            refl_lines.append(f"  next_actions={next_actions_raw}")
+        self.tools.append_context_note("reflector", "\n".join(refl_lines))
+
+    def _reflect_after_round(self, sample: SpatialSample, plan: dict) -> dict:
+        reflection = self.reflector.reflect(
+            sample.question, plan, self.tools.get_context_summary(),
+            visual_evidence=self.tools.get_visual_evidence_content())
+        self._append_reflection_context(reflection)
+        if self.verbose:
+            print(f"[REFLECTOR] confidence={reflection.get('confidence', 0):.2f} "
+                  f"decision={reflection.get('decision')}")
+        return reflection
+
+    def _should_terminate(self, reflection: dict) -> bool:
+        return (reflection.get("decision") == "terminate" or
+                float(reflection.get("confidence", 0.0)) >= self.confidence_threshold)
+
+    def _valid_next_actions(self, reflection: dict) -> list[dict]:
+        return [
+            a for a in (reflection.get("next_actions") or [])
+            if a.get("tool") in KNOWN_TOOLS
+        ]
+
+    def _plan_from_next_actions(self, reflection: dict) -> dict:
+        actions = self._valid_next_actions(reflection)
+        return {"plan": [
+            {
+                "step": i + 1,
+                "tool": action["tool"],
+                "params": action.get("params", {}),
+                "expected_evidence": action.get("reason", ""),
+            }
+            for i, action in enumerate(actions)
+        ]}
+
+    def _raw_tool_loop(self, sample: SpatialSample, plan: dict,
+                       max_rounds: int | None = None) -> int:
+        """Run raw-tool rounds; return number of rounds executed."""
         num_rounds = 0
         frame_paths = self.tools.context["frame_paths"]
-        for round_idx in range(self.max_rounds):
+        base_round = self._ordered_round_count()
+        round_limit = self.max_rounds if max_rounds is None else max_rounds
+        for round_idx in range(round_limit):
             num_rounds += 1
+            self.tools.append_context_text(f"Round {base_round + round_idx + 1}: raw-tool loop")
             if self.verbose:
                 print(f"\n--- Round {round_idx + 1} ---")
 
@@ -298,17 +462,17 @@ class Orchestrator:
                 action = self.reasoner.next_action(
                     plan, step_idx, self.tools.get_context_summary(),
                     sample.question, self.tools.tool_descriptions)
-                tool_name = action.get("tool", step["tool"])
-                # Guard against Reasoner hallucinating tool names — fall back
-                # to the planned tool if the LLM picked something outside the
-                # tool whitelist.
+                planned_tool = step["tool"]
+                tool_name = action.get("tool", planned_tool)
+                # Guard against Reasoner hallucinating tool names: fall back to the planned tool.
                 if tool_name not in KNOWN_TOOLS:
                     if self.verbose:
                         print(f"  ! Reasoner picked unknown tool {tool_name!r}; "
-                              f"falling back to planned {step['tool']!r}")
-                    tool_name = step["tool"]
+                              f"falling back to planned {planned_tool!r}")
+                    tool_name = planned_tool
                     if tool_name not in KNOWN_TOOLS:
                         step["status"] = "failed"
+                        self.tools.append_context_note(planned_tool, "FAILED: unknown planned tool")
                         continue
                 params = action.get("params", step.get("params", {}))
                 r = self.tools.execute_tool(tool_name, params, frame_paths)
@@ -319,20 +483,11 @@ class Orchestrator:
                     if r["success"]:
                         print(f"     {r['result_summary']}")
 
-            reflection = self.reflector.reflect(
-                sample.question, plan, self.tools.get_context_summary(),
-                visual_evidence=self.tools.get_visual_evidence_content())
-            if self.verbose:
-                print(f"[REFLECTOR] confidence={reflection.get('confidence', 0):.2f} "
-                      f"decision={reflection.get('decision')}")
+            reflection = self._reflect_after_round(sample, plan)
 
-            if reflection.get("decision") == "terminate" or \
-               float(reflection.get("confidence", 0.0)) >= self.confidence_threshold:
+            if self._should_terminate(reflection):
                 break
-            next_actions = reflection.get("next_actions", [])
-            # Filter out any hallucinated tools from Reflector's suggestions
-            next_actions = [a for a in next_actions
-                            if a.get("tool") in KNOWN_TOOLS]
+            next_actions = self._valid_next_actions(reflection)
             if not next_actions:
                 break
             base = len(plan.get("plan", []))
@@ -344,7 +499,6 @@ class Orchestrator:
                     "expected_evidence": action.get("reason", ""),
                 })
         return num_rounds
-
 
 def _downsample_frames(paths: list[str], k: int) -> list[str]:
     if len(paths) <= k:

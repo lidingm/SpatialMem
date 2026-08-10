@@ -30,7 +30,7 @@ _DEBUG_TRACES = os.getenv("SPATIALMEM_DEBUG_TRACES", "0") == "1"
 TOOL_DESCRIPTIONS = """=== Available Tools ===
 
 You have 11 tools in two categories. Choose ONLY the tools needed for the question.
-Dependencies between tools are handled automatically at runtime — you only need to plan the logical sequence.
+Plan tools in executable dependency order. In the interactive raw-tool loop, missing dependencies may be recovered by follow-up actions, but any directly re-executed plan (reconstruct/corrected_plan, run_with_plan, or generated SKILL code) must explicitly include all prerequisite tools.
 Distance, direction, counting, and object-size tools may internally call the passive Checker role to verify target objects from annotated frames. If SAM3 finds zero tracks for a required target, Checker answers directly from the raw frames and geometry is skipped.
 
 ────────────────────────────────────────────
@@ -122,22 +122,25 @@ Distance, direction, counting, and object-size tools may internally call the pas
    Depends on: instance_3d_localization
 
 8. direction_computation
-   What it does: Computes the relative direction of a target object w.r.t. a reference object, as seen from a viewpoint. Projects onto the horizontal plane; returns direction labels (front/back/left/right combinations) and angular offsets.
+   What it does: Computes the direction of `target_target` from an anchor point, under an observer viewpoint/facing direction. Projects onto the horizontal plane; returns direction labels (front/back/left/right combinations) and angular offsets.
+   Fill params from one of these templates:
+     - Egocentric / "my" direction: "standing by X facing Y, is Z to my left/right/front-left/..." -> `reference_target=X`, `target_target=Z`, `viewpoint_type="object"`, `viewpoint_target=X`, `facing_target=Y`. Do NOT use Y as `reference_target`.
+     - Object-relative direction: "standing by A facing B, is Z to the left/right/front/back of Y" -> `reference_target=Y`, `target_target=Z`, `viewpoint_type="object"`, `viewpoint_target=A`, `facing_target=B`. If there is no facing phrase, omit `facing_target`; if there is no standing/from object, use `viewpoint_type="camera"`.
    How forward direction is determined:
-     - If `facing` is given: forward = viewpoint → facing object (use when the person faces a specific object)
-     - If `facing` is absent: forward = viewpoint → reference object (default: person implicitly faces the reference)
+     - If `facing_target`/`facing` is given: forward = viewpoint -> facing object (use when the person faces a specific object)
+     - If facing is absent: forward = viewpoint -> reference object (default: person implicitly faces the reference)
      - If viewpoint_type="camera": forward = camera's own optical axis toward reference
    Parameters:
      - viewpoint_target / reference_target / target_target / facing_target (str, optional): object category names; prefer these whenever known so Checker can validate tracks and resolve the final instance internally
      - viewpoint_type (str): "camera" or "object"
      - viewpoint (int, optional): concrete instance ID if viewpoint_type="object", or frame index if viewpoint_type="camera"; do NOT pass placeholder strings such as "<id_of_chair>"
-     - reference (int, optional): concrete instance ID of the anchor object; do NOT pass placeholder strings
+     - reference (int, optional): concrete instance ID of the anchor object; for "to my ..." questions this anchor is the observer position, not the facing object
      - reference_type (str): "object" (almost always)
      - target (int, optional): concrete instance ID of the object whose direction is asked; do NOT pass placeholder strings
      - target_type (str): "object" (almost always)
-     - facing (int, optional): concrete instance ID of the object the person is LOOKING AT — defines the forward direction. Required when viewpoint == reference (otherwise forward is undefined). Omit if the person implicitly faces the reference.
+     - facing (int, optional): concrete instance ID of the object the person is LOOKING AT; defines the forward direction. Required when viewpoint == reference. Omit only if the person implicitly faces the reference.
      - facing_type (str): "object" (default)
-   Output includes: direction label, lr_angle_deg, fb_angle_deg, and angle_from_forward_deg (unsigned 0-180 degrees from observer forward to reference→target).
+   Output includes: direction label, lr_angle_deg, fb_angle_deg, and angle_from_forward_deg (unsigned 0-180 degrees from observer forward to reference->target).
    Depends on: instance_3d_localization, depth_estimation
 
 9. instance_counting
@@ -199,7 +202,63 @@ class ToolRegistry:
         if self.checker is not None:
             self.checker.set_checker_notes(notes)
 
+    def append_context_text(self, text: str) -> None:
+        text = str(text or "").strip()
+        if text:
+            self._context.setdefault("ordered_context", []).append(text)
+
+    def append_context_note(self, label: str, text: str) -> None:
+        text = str(text or "").strip()
+        if not text:
+            return
+        lines = text.splitlines()
+        block = f"[{label}] {lines[0]}"
+        if len(lines) > 1:
+            block += "\n" + "\n".join(lines[1:])
+        self.append_context_text(block)
+
+    def _format_final_localization_summary(self) -> str:
+        ann = self._context.get("final_localization_annotations") or {}
+        r3d = self._context.get("results_3d") or {}
+        instances = r3d.get("instances") or []
+        by_id = {int(it["id"]): it for it in instances if "id" in it}
+        targets = ann.get("targets", [])
+        lines = [f"{len(targets)} final target localization(s) after Checker review:"]
+        for t in targets:
+            it = by_id.get(int(t.get("instance_id", -999999)))
+            center = t.get("center_3d_m") or (it or {}).get("center_3d_m")
+            size = t.get("bbox_size_m") or (it or {}).get("bbox_size_m")
+            geom = ""
+            if center is not None and size is not None:
+                geom = (
+                    f", center=({float(center[0]):.3f}, {float(center[1]):.3f}, {float(center[2]):.3f})m"
+                    f", bbox_size=({float(size[0]):.3f}, {float(size[1]):.3f}, {float(size[2]):.3f})m"
+                )
+            lines.append(f"  {t.get('instance_label')}: keep={t.get('keep_frames')}{geom}")
+        return "\n".join(lines)
+
+    def _maybe_append_new_checker_context(self, prev_checker_len: int) -> None:
+        for s in self._context.get("checker_summaries", [])[prev_checker_len:]:
+            if s:
+                self.append_context_note("checker", str(s))
+
+        ann = self._context.get("final_localization_annotations") or {}
+        targets = ann.get("targets") or []
+        if not targets:
+            return
+        sig = tuple(
+            (str(t.get("instance_label", "")), tuple(t.get("keep_frames") or []))
+            for t in targets
+        )
+        if sig and sig != self._context.get("_ordered_context_final_loc_sig"):
+            self._context["_ordered_context_final_loc_sig"] = sig
+            self.append_context_note("final_localization", self._format_final_localization_summary())
+
     def get_context_summary(self) -> str:
+        ordered = self._context.get("ordered_context") or []
+        if ordered:
+            return "\n".join(str(x) for x in ordered if str(x).strip())
+
         parts: list[str] = []
         if "da3_result" in self._context:
             r = self._context["da3_result"]
@@ -265,17 +324,11 @@ class ToolRegistry:
             if cal and cal.get("error") is None:
                 parts.append(f"  (3D clustering proposed {cal['base_count']}; a VLM reviewed "
                              f"the annotated frames and corrected it to {cal['adjusted_count']})")
-                for a in cal.get("applied", []):
-                    parts.append(f"    - {a}")
 
         if "checker_direct_answer" in self._context:
             ans = self._context["checker_direct_answer"]
             parts.append(f"[checker] raw-sample direct answer = {ans.get('answer')!r}; "
                          f"reason={ans.get('reason', '')}")
-
-        for s in self._context.get("skill_summaries", []):
-            if s:
-                parts.append(str(s))
 
         for s in self._context.get("checker_summaries", []):
             if s:
@@ -327,6 +380,11 @@ class ToolRegistry:
             ) \
                and entry.get("success"):
                 parts.append(f"[{entry['tool_name']}] {entry.get('result_summary', '')}")
+
+
+        for s in self._context.get("skill_summaries", []):
+            if s:
+                parts.append(str(s))
 
         return "\n".join(parts) if parts else "No tool results yet."
 
@@ -410,18 +468,25 @@ class ToolRegistry:
 
     def execute_tool(self, tool_name: str, params: dict,
                      frame_paths: list[str]) -> dict:
+        prev_checker_len = len(self._context.get("checker_summaries", []))
         try:
             result = self._dispatch(tool_name, params, frame_paths)
             entry = {"tool_name": tool_name, "params": params,
                      "success": True, "result_summary": result["summary"],
                      "error": None}
             self._tool_log.append(entry)
+            # Checker/final localization are internal evidence for derived tools;
+            # show them before the derived computation summary in ordered context.
+            self._maybe_append_new_checker_context(prev_checker_len)
+            self.append_context_note(tool_name, result["summary"])
             return entry
         except Exception as e:
             entry = {"tool_name": tool_name, "params": params,
                      "success": False, "result_summary": "",
                      "error": str(e)}
             self._tool_log.append(entry)
+            self.append_context_note(tool_name, f"FAILED: {e}")
+            self._maybe_append_new_checker_context(prev_checker_len)
             if _DEBUG_TRACES:
                 traceback.print_exc()
             return entry
@@ -538,8 +603,7 @@ class ToolRegistry:
         per_frame = [f"frame{i}:{len(s['scores'])}" for i, s in enumerate(seg_results) if len(s["scores"]) > 0]
         return {"summary": f"Object segmentation done: prompt='{text_prompt}', "
                            f"{n_tracks} tracked instance(s), {total} detections across "
-                           f"{len(seg_results)} frames ({', '.join(per_frame)}); "
-                           f"saved to {sam3_dir}"}
+                           f"{len(seg_results)} frames ({', '.join(per_frame)})"}
 
     @staticmethod
     def _safe_output_name(name: str) -> str:
@@ -794,7 +858,6 @@ class ToolRegistry:
             parts.append(f"  (3D clustering produced {cal['base_count']} candidate instance(s); "
                          f"a VLM reviewed the annotated frames and corrected it to "
                          f"{cal['adjusted_count']})")
-            parts += [f"    - {a}" for a in cal.get("applied", [])] or ["    - (no corrections)"]
             parts.append(f"  Answer with FINAL COUNT = {c['total_unique']}.")
         else:
             parts.append(f"  instance ids={c['obj_id_list']}")
@@ -810,10 +873,86 @@ class ToolRegistry:
         result = run_direction_task(params, self._context, self.checker, frame_paths)
         return {"summary": result["summary"]}
 
+    @staticmethod
+    def _format_stat_prior(stat: dict, unit: str) -> str | None:
+        if not isinstance(stat, dict) or "mean" not in stat:
+            return None
+        mean = float(stat.get("mean", 0.0))
+        std = float(stat.get("std", 0.0))
+        lo = max(0.0, mean - std)
+        hi = mean + std
+        return f"{mean:.2f}+/-{std:.2f}{unit} (approx range {lo:.2f}-{hi:.2f}{unit})"
+
+    def _object_size_prior_summary(self, object_name: str) -> str:
+        name = str(object_name or "").strip().lower()
+        if not name or self.memory is None:
+            return f"[prior] object size prior for {name or 'target object'}: no prior available"
+        try:
+            prior = self.memory.get_object_size_prior(name)
+        except Exception:
+            prior = None
+        if not prior:
+            return f"[prior] object size prior for {name}: no prior available"
+        parts = []
+        for key in ("width", "height", "depth"):
+            item = self._format_stat_prior(prior.get(key), "m")
+            if item:
+                parts.append(f"{key}={item}")
+        return f"[prior] object size prior for {name}: " + (", ".join(parts) if parts else "no prior available")
+
+    def _scene_size_prior_summary(self) -> str:
+        scene_type = str(self._context.get("scene_type") or "").strip().lower()
+        if not scene_type or self.memory is None:
+            return f"[prior] scene size prior for {scene_type or 'current room'}: no prior available"
+        try:
+            prior = self.memory.get_scene_scale_prior(scene_type)
+        except Exception:
+            prior = None
+        if not prior:
+            return f"[prior] scene size prior for {scene_type}: no prior available"
+        parts = []
+        for key in ("floor_area", "width", "height", "depth"):
+            unit = "m2" if key == "floor_area" else "m"
+            item = self._format_stat_prior(prior.get(key), unit)
+            if item:
+                parts.append(f"{key}={item}")
+        return f"[prior] scene size prior for {scene_type}: " + (", ".join(parts) if parts else "no prior available")
+
+    def append_task_prior_context(self, task_type: str = "", task_category: str = "",
+                                  object_names: list[str] | None = None) -> None:
+        """Append task-relevant priors before finalization, even if size tools failed."""
+        task = f"{task_type} {task_category}".lower()
+        existing = "\n".join(str(x) for x in self._context.get("ordered_context", []))
+
+        if "object_size" in task or ("object" in task and "size" in task):
+            names = []
+            for name in list((self._context.get("seg_categories") or {}).values()) + list(object_names or []):
+                name = str(name or "").strip().lower()
+                if name and name not in names:
+                    names.append(name)
+            for name in names:
+                line = self._object_size_prior_summary(name)
+                if line not in existing:
+                    self.append_context_text(line)
+                    existing += "\n" + line
+
+        if "room_size" in task or "scene_size" in task:
+            line = self._scene_size_prior_summary()
+            if line not in existing:
+                self.append_context_text(line)
+
     def _run_object_size(self, params, frame_paths):
         from tools.code_execution.object_size_computation import run_object_size_task
         result = run_object_size_task(params, self._context, self.checker, frame_paths)
-        return {"summary": result["summary"]}
+        object_name = (
+            (result.get("object_size") or {}).get("object")
+            or params.get("object_name")
+            or params.get("target")
+            or params.get("obj")
+            or params.get("object_category")
+        )
+        summary = result["summary"]
+        return {"summary": summary}
 
     def _run_scene_size(self):
         pts = self._context.get("points")
@@ -826,6 +965,9 @@ class ToolRegistry:
         ss = compute_scene_size(pts, conf=conf, output_dir=self.output_root / "spatial")
         self._context["scene_size"] = ss
         ext = ss["extent_xyz"]
-        return {"summary": f"Scene size: width={ext[0]:.2f}m, height={ext[1]:.2f}m, "
-                           f"depth={ext[2]:.2f}m, floor_area={ss['floor_area']:.2f}m2, "
-                           f"points used: {ss['n_points_clean']}/{ss['n_points_raw']}"}
+        summary = (
+            f"Scene size: width={ext[0]:.2f}m, height={ext[1]:.2f}m, "
+            f"depth={ext[2]:.2f}m, floor_area={ss['floor_area']:.2f}m2, "
+            f"points used: {ss['n_points_clean']}/{ss['n_points_raw']}"
+        )
+        return {"summary": summary}

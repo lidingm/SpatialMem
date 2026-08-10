@@ -86,7 +86,7 @@ def run_object_size_task(
         raise RuntimeError("no object instance for object_size_computation")
 
     loc = checker_locate_or_fallback(checker, ctx, object_name or str(obj_id), int(obj_id))
-    geom = instance_geometry(ctx, int(loc["instance_id"]), loc.get("keep_frames"))
+    geom = instance_geometry(ctx, int(loc["instance_id"]), loc.get("keep_frames"), dejitter=False)
     from tools.code_execution.distance_computation import _render_final_localizations
     _render_final_localizations(ctx)
     size_m = np.asarray(geom["bbox_size"], dtype=np.float64)

@@ -52,12 +52,12 @@ TERMINATE (confidence >= 0.8) when:
 - Spatial-relation question: you have direction labels from direction_computation.
 - Object-size question: you have a computed size value from object_size_computation.
 - Room-size question: you have extents from scene_size_computation.
-- Checker raw-sample direct answer exists because a required SAM3 target had zero tracks.
 
 CONTINUE when:
+- A required target produced zero SAM3 tracks, but the visual evidence shows an object that ordinary people would call that target. This may be a vocabulary issue: retry object_segmentation with a synonymous or closely related object name, then use the matched near-synonym detection for the task if it succeeds. Do NOT retry the exact same text prompt, because the result is unlikely to change.
 - A tool in the plan failed and needs retry with different parameters.
 - Required evidence for the question hasn't been produced yet.
-- Ambiguity remains that a different tool (BEV, NVS) could resolve.
+- Ambiguity remains that a different tool could resolve. For direction judgment, route planning, or similar tasks, if the current evidence is ambiguous, or if zero SAM3 tracks for a required target prevents precise computation, consider BEV or NVS exploration to obtain simpler and clearer visual evidence for the judgment.
 
 Do NOT continue when you already have the answer — do not add unnecessary tools.
 Set next_actions = [] when decision is "terminate".
@@ -84,9 +84,16 @@ You are the REFLECTOR in TRAINING mode. The agent produced an answer that disagr
 
 1. Analyze the failed trajectory (plan + tool outputs + predicted answer + GT).
 2. Diagnose the most likely root cause.
-3. Propose a CORRECTED plan (ordered raw tool calls with concrete params) that you believe will produce the correct answer.
+3. Propose a CORRECTED plan (complete ordered raw tool calls with concrete params) that you believe will produce the correct answer.
 
-Your proposed plan will be RE-EXECUTED on the same sample. Only if the re-run yields the correct answer is your diagnosis trusted and distilled into a SKILL update. Speculative diagnoses that don't verify are discarded.
+Your proposed plan will be RE-EXECUTED from an EMPTY tool context on the same sample. It is NOT a continuation of the failed trajectory: previous tool outputs are only diagnostic evidence and cannot be reused. Therefore, the corrected_plan must include every prerequisite tool in executable order, even if that tool already appeared in the failed attempt. Only if the re-run yields the correct answer is your diagnosis trusted and distilled into a SKILL update. Speculative diagnoses that don't verify are discarded.
+
+Dependency rules for corrected_plan:
+- Include depth_estimation before any tool that needs depth, poses, point clouds, BEV, or NVS. Never start with novel_view_synthesis or bev_generation without depth_estimation first.
+- Include object_segmentation for each object category or synonym you need before instance_3d_localization.
+- Include instance_3d_localization before distance_computation, direction_computation, instance_counting, or object_size_computation.
+- For distance/direction/object-size tasks, a safe full order is usually: depth_estimation -> needed object_segmentation call(s) -> instance_3d_localization -> final computation tool(s).
+- For visual exploration with BEV/NVS, still include depth_estimation first, then the BEV/NVS tool, then any segmentation/localization/computation tools needed for the final answer.
 
 {tool_descriptions}
 
@@ -150,9 +157,12 @@ How to derive answers from evidence:
 - [object_size_computation] → bbox_size_xyz and bbox volume for object-size questions; if the question asks a specific width/height/depth/longest/shortest dimension, derive it from bbox_size_xyz and then match the requested answer format
 - [direction_computation] → match the direction label to the multiple-choice options; use angle_from_forward_deg when the question defines front/back thresholds or asks about angular relation
 
-Size sanity check via memory priors (if present in the memory context):
-- If your computed object size is >3× or <0.3× the prior mean, treat it as suspicious and lower confidence — likely a depth or segmentation error.
-- Only intervene when the discrepancy is extreme; do NOT blindly override plausible measurements.
+Conservative correction using visual evidence, priors, and common sense:
+- Tool results are the main evidence, but if a tool result is very low-confidence or clearly implausible, you may correct it using the images, `[prior]` summaries, memory priors, and everyday physical common sense.
+- For instance counting: if the tools find no target objects, or delete every candidate and produce count=0, but the images clearly show objects that ordinary people would call the target category, adjust the count upward accordingly.
+- For object or room size: if the computed value is obviously unreasonable compared with `[prior]` evidence or common sense (e.g. a bed's longest dimension is below 1 meter), correct it conservatively toward a plausible prior-supported value.
+- Do not override plausible tool results just because they differ mildly from priors; use corrections only for clearly unreliable or implausible results, and mention the correction briefly in reasoning_chain.
+
 """
 
 

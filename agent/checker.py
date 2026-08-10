@@ -14,9 +14,10 @@ from typing import Any
 
 
 CALIBRATE_SYSTEM = (
-    "You are a meticulous visual verifier for an automated 3D object-counting "
-    "pipeline. Be conservative: report ONLY errors you are highly confident about. "
-    "Respond with valid JSON only."
+    "You are a meticulous visual verifier for an automated visual reasoning "
+    "pipeline. Follow the task-specific user instructions carefully, inspect the "
+    "provided visual evidence, and correct clear visual mistakes when the evidence "
+    "supports it. Respond with valid JSON only."
 )
 
 
@@ -56,6 +57,105 @@ Relevant Checker experience from the active SKILL:
 Use these notes only when they apply to the current visual evidence. They are
 past Checker-specific lessons, not a substitute for inspecting the frames.
 """
+
+
+def validate_count_split(split: dict, frames_by_id: dict[int, set[int]],
+                         allowed_ids: set[int] | None = None) -> tuple[bool, str, dict]:
+    """Validate and normalize a count-checker split before it can affect count.
+
+    Model output is 1-based; internal ids are 0-based. A valid split must be a
+    complete partition of that track's frames into target groups plus optional
+    non-target frames, with no invented, duplicated, overlapping, or missing frames.
+    """
+    parsed: dict[str, Any] = {}
+    try:
+        gid = int(split.get("instance", 0)) - 1
+    except Exception:
+        return False, "instance is not an integer", parsed
+    parsed["instance_id"] = gid
+    if gid not in frames_by_id:
+        return False, f"instance {gid + 1} is not in CURRENT RESULT", parsed
+    if allowed_ids is not None and gid not in allowed_ids:
+        return False, f"instance {gid + 1} was already removed or merged", parsed
+
+    original_frames = set(int(f) for f in (frames_by_id.get(gid) or set()))
+    if not original_frames:
+        return False, f"instance {gid + 1} has no listed frames to split", parsed
+
+    try:
+        n_target = int(split.get("n_target", 0))
+        n_non_target = int(split.get("n_non_target", 0))
+    except Exception:
+        return False, "n_target/n_non_target must be integers", parsed
+    parsed["n_target"] = n_target
+    parsed["n_non_target"] = n_non_target
+    if n_target < 1:
+        return False, "n_target must be at least 1", parsed
+    if n_non_target < 0:
+        return False, "n_non_target must be non-negative", parsed
+
+    raw_groups = split.get("target_frame_groups") or []
+    if not isinstance(raw_groups, list):
+        return False, "target_frame_groups must be a list", parsed
+    if len(raw_groups) != n_target:
+        return False, "target_frame_groups must contain exactly n_target groups", parsed
+
+    target_frames: set[int] = set()
+    norm_groups: list[list[int]] = []
+    for gi, group in enumerate(raw_groups, start=1):
+        if not isinstance(group, list) or not group:
+            return False, f"target frame group {gi} is empty or not a list", parsed
+        try:
+            frames = [int(f) for f in group]
+        except Exception:
+            return False, f"target frame group {gi} contains a non-integer frame", parsed
+        if len(frames) != len(set(frames)):
+            return False, f"target frame group {gi} repeats a frame", parsed
+        fset = set(frames)
+        invented = sorted(fset - original_frames)
+        if invented:
+            return False, f"target frame group {gi} uses frames not in instance {gid + 1}: {invented}", parsed
+        overlap = sorted(target_frames & fset)
+        if overlap:
+            return False, f"frames assigned to multiple target groups: {overlap}", parsed
+        target_frames |= fset
+        norm_groups.append(sorted(fset))
+
+    raw_non_target = split.get("non_target_frames") or []
+    if not isinstance(raw_non_target, list):
+        return False, "non_target_frames must be a list", parsed
+    try:
+        non_target_frames = [int(f) for f in raw_non_target]
+    except Exception:
+        return False, "non_target_frames contains a non-integer frame", parsed
+    if len(non_target_frames) != len(set(non_target_frames)):
+        return False, "non_target_frames repeats a frame", parsed
+    non_target = set(non_target_frames)
+    invented = sorted(non_target - original_frames)
+    if invented:
+        return False, f"non_target_frames uses frames not in instance {gid + 1}: {invented}", parsed
+    overlap = sorted(target_frames & non_target)
+    if overlap:
+        return False, f"frames assigned to both target and non-target: {overlap}", parsed
+    if n_non_target == 0 and non_target:
+        return False, "n_non_target is 0 but non_target_frames is non-empty", parsed
+    if n_non_target > 0 and not non_target:
+        return False, "n_non_target is positive but non_target_frames is empty", parsed
+
+    assigned = target_frames | non_target
+    missing = sorted(original_frames - assigned)
+    if missing:
+        return False, f"some frames of instance {gid + 1} are unassigned: {missing}", parsed
+    extra = sorted(assigned - original_frames)
+    if extra:
+        return False, f"split uses nonexistent frames for instance {gid + 1}: {extra}", parsed
+
+    parsed.update({
+        "target_frame_groups": norm_groups,
+        "non_target_frames": sorted(non_target),
+        "original_frames": sorted(original_frames),
+    })
+    return True, "", parsed
 
 
 LEGACY_BUILD_CALIBRATION_PROMPT_REFERENCE = '''
@@ -174,13 +274,13 @@ Hard rules:
 
 Respond with JSON ONLY, exactly this schema:
 {{
-  "missed":   [{{"description": "where it is", "frames": [0], "confidence": 0.0}}],
-  "spurious": [{{"instance": 1, "reason": "...", "confidence": 0.0}}],
-  "merge":    [{{"instances": [1, 2], "reason": "...", "confidence": 0.0}}],
+  "missed":   [{{"description": "where it is", "frames": [0]}}],
+  "spurious": [{{"instance": 1, "reason": "..."}}],
+  "merge":    [{{"instances": [1, 2], "reason": "..."}}],
   "split":    [{{"instance": 1, "n_target": 2, "n_non_target": 0,
                 "target_frame_groups": [[0, 1], [5, 6]],
                 "non_target_frames": [8],
-                "reason": "...", "confidence": 0.0}}],
+                "reason": "..."}}],
   "reasoning": "one short paragraph"
 }}"""
 '''
@@ -195,105 +295,110 @@ def build_calibration_prompt(object_name: str, instances: list[dict],
         f"{it['bbox_size_m'][2]:.2f} m"
         for it in instances) or "  (none - the pipeline found nothing)"
 
-    return f'''GOAL: inspect the frames carefully, correct the pipeline when the visual evidence supports it, and count every "{object_name}" in this room as accurately as possible.
+    return f'''GOAL: review the annotated frames and correct the pipeline's instance count for "{object_name}".
 
-The {n_frames} images are consecutive frames sampled from ONE walkthrough video of the
-SAME room. An automated pipeline (open-vocabulary segmentation + cross-frame tracking + 3D
-clustering) has already produced a result. Every detected instance is drawn as a colored
-bounding box with a small same-colored label "{object_name} N".
+The {n_frames} images are consecutive sampled frames from ONE walkthrough of the SAME room.
+The pipeline has already detected candidate instances using segmentation, tracking, and 3D clustering.
+Each candidate is drawn with a colored box and label like "{object_name} N".
 
-CURRENT RESULT - {len(instances)} instance(s):
+CURRENT RESULT - {len(instances)} candidate instance(s):
 {inst_lines}
 
-Typical real-world size for "{object_name}" (agent memory priors): {prior_str}
-{_checker_notes_block(checker_notes)}
+Use the common everyday understanding of the category "{object_name}". Count objects
+that people would normally recognize as members, common subtypes, or normal functional variants
+of that category. For example, "table" includes dining tables, coffee tables, side tables, desk,
+bedside/night tables, and TV/console tables, but not plant stands, shelves, racks, or counters.
+For "door", room, passage, or entrance doors count, but cabinet, wardrobe, appliance, or
+furniture-panel doors do not. Report "spurious" only when the labeled object is clearly not
+the target category in ordinary usage; if it is a plausible common subtype or reasonable
+borderline use of the category name, keep it. Use visual evidence together with everyday
+common sense: For example, if the current result is implausibly high for large furniture in one
+room (e.g. many sofas or tables), carefully check for duplicate tracks to merge and clear
+non-target detections to remove.
 
-WHAT COUNTS AS A "{object_name}" - take the category in its narrow, everyday sense:
-  Count only standalone objects a person would plainly call a "{object_name}". Do NOT count
-  look-alike parts of other objects. E.g. "door" = the room's doors only, NOT cabinet /
-  wardrobe / oven / washing-machine doors.
+Return CORRECTIONS ONLY. If a labeled track is already correct, omit it from all correction lists.
+Do not use any field to confirm normal tracks.
 
-Your job is to CHECK and CORRECT the current result from the images, not to defer to the
-pipeline by default. Review ALL frames and actively look for count errors in these four categories:
-  1. "missed"   - a real {object_name} that the pipeline never counted at all: it carries NO
-                  colored box in ANY frame. Search carefully for such objects.
-  2. "spurious" - a labeled instance that is not actually a {object_name}.
-  3. "merge"    - two or more labeled instances are actually the SAME physical object seen in
-                  different frames or viewpoints. If two tracks stay in the same room location
-                  with the same surrounding context and landmarks, merge them.
-  4. "split"    - one labeled instance actually covers multiple physical objects across frames.
+The goal is to count physical object instances, not perfectly segmented full-object boxes.
+Do NOT mark a label as "spurious" merely because the box shows only part of a real target
+object, is cropped, or covers a surface/part of that target.
 
-DECISION PROCEDURE - inspect the actual images, not just the listed tracks.
-For EACH labeled instance, look across all of its frames and ask:
-"Across all frames of this one track, how many DISTINCT physical objects do its boxes actually land on?"
-  - exactly 1 physical object, and it IS a real {object_name}
-      -> leave it unchanged
-  - exactly 1 physical object, and it is NOT a real {object_name}
-      -> report "spurious"
-      -> fill:
-         * "instance": the track id number
-         * "reason": why this track is not a real {object_name}
-         * "confidence": your confidence in this correction
-  - 2 or more DISTINCT physical objects across frames
-      -> report "split"
-      -> this means one track jumped across multiple objects and merged them incorrectly
+Correction types and fields:
+  - "spurious": one labeled instance is clearly not {object_name} in ordinary usage. Use this
+    only for clear non-targets; keep plausible common subtypes and reasonable borderline cases.
+    Fields: "instance", "reason".
+  - "merge": two or more labels are the SAME physical {object_name} and should count once;
+    use it only when appearance, shape, and surrounding room context are all consistently the same.
+    Use merge only when you are very certain the labels must be the same object; be especially cautious when there are few objects.
+    Fields: "instances", "reason".
+  - "split": one label covers multiple DIFFERENT physical objects across that label's OWN frames.
+    Use split only for a tracker jump within a single label; if the same object reappears with
+    another label after a camera-angle/viewpoint change, that is "merge", not "split".
+    Fields: "instance", "n_target", "n_non_target", "target_frame_groups", "non_target_frames", "reason".
+  - "missed": a real {object_name} is visible but never boxed in any frame.
+    Fields: "description", "frames".
 
-For every "split", you MUST fill the fields precisely:
-  - "instance": the track id number being split
-  - "n_target": how many DISTINCT real {object_name} objects this track covers across all its frames
-  - "n_non_target": how many DISTINCT non-target objects this track covers across all its frames
-  - "target_frame_groups": one frame-index list for each real target object
-      * the number of inner lists MUST equal n_target
-      * each inner list must contain the frames where the box is on that one real target object
-      * if n_target = 1, provide exactly one inner list
-  - "non_target_frames": all frames where the box is on something that is NOT a real {object_name}
-      * if n_non_target = 0, use []
-      * if n_non_target > 0, this list should not be empty
-  - "reason": explain briefly how the track jumps across different objects
-  - "confidence": your confidence in this correction
+Pipeline failure modes to check carefully:
+  - Because frames are sparsely sampled, tracking can be discontinuous: the SAME physical
+    object may disappear for a while and later receive a new label. Check possible merges, but
+    merge only when the labels point to the same room location with consistent surrounding
+    landmarks; do not merge merely because objects look alike or appear in non-overlapping frames.
+  - Because SAM/open-vocabulary segmentation can use a broad category meaning, some boxes may
+    cover related but non-target objects. Remove clear non-target labels with "spurious", but
+    keep common subtypes, normal functional variants, and reasonable borderline cases.
 
-CRITICAL RULES FOR "split" VS "spurious":
-  - If a track contains ANY real {object_name} in any frame, do NOT call it "spurious".
-  - Use "spurious" ONLY when the track contains NO real {object_name} in any frame at all.
-  - Even if only ONE covered object is a real {object_name} and the rest are wrong objects,
-    this is still "split", with n_target=1 and n_non_target=k.
+Decision procedure:
+  1. Check each labeled track across only the frames listed for that track.
+     - If it contains exactly one real {object_name}, leave it unchanged and output nothing for it.
+     - If it contains exactly one object that is not reasonably recognized as {object_name}, report "spurious".
+     - If this same track jumps between multiple DIFFERENT physical objects, report "split".
+       Do not split temporal chunks of the same physical object.
+  2. Compare different labels with each other.
+     Check for possible merges, but require strong evidence that the labels refer to the same
+     physical target object: same room location, consistent surrounding landmarks, no same-frame
+     co-occurrence, and no clear conflict in stable visual attributes such as color/material/shape.
+     Similar-looking objects should remain separate unless the spatial context makes the same-object
+     interpretation clear. If matching labels are the same non-target object, report them as
+     "spurious" instead. Keep labels separate when they are clearly different target objects.
+  3. Check for completely missed targets.
+     Report "missed" only for a real target that has no colored box in any frame.
 
-Then compare DIFFERENT labels against each other and ask:
-"Do these different track IDs actually point to the SAME physical {object_name}?"
-  - If two labels appear in different frames but match the SAME {object_name} at the SAME room location and 
-  surrounding environment, report "merge".
-  - For "merge", fill:
-      * "instances": the list of track id numbers that refer to the same real object
-      * "reason": why these tracks correspond to the same object
-      * "confidence": your confidence in this correction
-  - If two visually similar objects sit in different places, keep them separate.
-  - Two boxes visible in the SAME frame are always different physical objects, so never merge them.
-
-Before finalizing your answer, also check for completely missed targets:
-"Is there any real {object_name} visible in the frames that never receives any box in any frame at all?"
-  - If YES, report "missed".
-  - Use "missed" ONLY for a real target object that is never boxed in any frame.
-  - If the same physical object is boxed in some other frame, it is already counted and must NOT be reported as missed.
-  - For every "missed", fill:
-      * "description": a short description of where the missed object is
-      * "frames": the frame indices where this missed object is visible
-      * "confidence": your confidence in this correction
-  - If you find multiple never-boxed target objects, report each one as a separate entry in "missed".
-
-CONFIDENCE GUIDANCE:
-  Base confidence on visible evidence in the frames. You do NOT need impossible certainty.
-  If the images give clear support for a correction, report it with an honest confidence.
-  Do not suppress a visually well-supported correction merely because the pipeline said otherwise.
+Parameter validity rules:
+  - Use ONLY the candidate labels listed in CURRENT RESULT. The instance id is the number in
+    the visible label, e.g. "{object_name} 3" means instance=3. Do not invent ids, and do not
+    use raw SAM track ids or frame numbers as instance ids.
+  - For "spurious", "instance" must be one listed candidate id.
+  - For "merge", "instances" must contain two or more listed candidate ids, and every id must
+    be a real {object_name}. Never merge labels that appear in the same frame, labels also reported
+    as "spurious", invented ids, or clearly different-looking objects.
+  - For "split", "instance" must be one listed candidate id. Use split ONLY when that label's
+    boxes land on multiple distinct complete objects; different parts, surfaces, bedding,
+    panels, temporal chunks, camera-angle changes, or visible regions of the SAME object are not split.
+  - For "split", all "target_frame_groups" and "non_target_frames" must use only frames listed
+    for that same candidate in CURRENT RESULT. Never include frames belonging only to another label.
+  - For "split", "target_frame_groups" must contain exactly n_target non-empty frame lists, one
+    per distinct real target object. If you cannot assign legal separate frame groups for separate
+    complete objects, do not split.
+  - If a second physical object already has its own label, do not add that other label's frames
+    to a split. Use "merge" if the labels are the same object, or leave them separate if they
+    are different objects.
+  - If your reason says the same object was assigned separate labels, or was split because of
+    viewpoint/camera-angle changes, the operation must be "merge" instead of "split".
+  - For "missed", use frame indices where the never-boxed target is visible.
+  - Each listed candidate id should appear in at most one correction type. Choose the single
+    operation that best describes the error. If the reason identifies an object as non-target,
+    that id belongs in "spurious", not "merge".
+  - Keep every "reason" to one short sentence. Do not repeat the same phrase or frame list.
 
 Respond with JSON ONLY, exactly this schema:
 {{
-  "missed":   [{{"description": "where it is", "frames": [0], "confidence": 0.0}}],
-  "spurious": [{{"instance": 1, "reason": "...", "confidence": 0.0}}],
-  "merge":    [{{"instances": [1, 2], "reason": "...", "confidence": 0.0}}],
-  "split":    [{{"instance": 1, "n_target": 2, "n_non_target": 0,
+  "missed":   [{{"description": "where it is", "frames": [0]}}],
+  "spurious": [{{"instance": 1, "reason": "..."}}],
+  "merge":    [{{"instances": [1, 2], "reason": "..."}}],
+  "split":    [{{"instance": 1, "n_target": 2, "n_non_target": 1,
                 "target_frame_groups": [[0, 1], [5, 6]],
                 "non_target_frames": [8],
-                "reason": "...", "confidence": 0.0}}],
+                "reason": "..."}}],
   "reasoning": "one short paragraph"
 }}'''
 
@@ -303,7 +408,6 @@ def llm_calibrate_count(
     annotated_frames: list[str],
     instances: list[dict],
     memory=None,
-    conf_threshold: float = 0.7,
     max_side: int = 640,
     max_tokens: int = 2000,
     checker_notes: str | None = None,
@@ -339,47 +443,59 @@ def llm_calibrate_count(
         )
     except Exception as e:  # noqa: BLE001 - calibration must never break counting
         out["error"] = f"llm call failed: {e}"
-        print(f"[CHECKER RAW] count/{object_name} ERROR: {out['error']}")
         return out
-    print(f"[CHECKER RAW] count/{object_name}:\n{resp.get('_raw_response', resp)}")
     out["raw"] = resp
 
     alive = set(base_ids)
     applied: list[str] = []
+    ignored: list[str] = []
     split_delta = 0
+    frames_by_id = {
+        int(it["id"]): {int(f) for f in (it.get("frames") or [])}
+        for it in instances
+    }
+
+    def _cooccurs(group: list[int]) -> bool:
+        for i, a in enumerate(group):
+            for b in group[i + 1:]:
+                if frames_by_id.get(a, set()) & frames_by_id.get(b, set()):
+                    return True
+        return False
 
     for s in (resp.get("spurious") or []):
-        if float(s.get("confidence", 0)) >= conf_threshold:
-            gid = int(s.get("instance", 0)) - 1
-            if gid in alive:
-                alive.discard(gid)
-                applied.append(f"spurious: dropped {object_name} {gid + 1} — {s.get('reason', '')}")
+        gid = int(s.get("instance", 0)) - 1
+        if gid in alive:
+            alive.discard(gid)
+            applied.append(f"spurious: dropped {object_name} {gid + 1} - {s.get('reason', '')}")
 
     for m in (resp.get("merge") or []):
-        if float(m.get("confidence", 0)) >= conf_threshold:
-            grp = sorted({int(x) - 1 for x in (m.get("instances") or [])} & alive)
-            if len(grp) >= 2:
-                for g in grp[1:]:
-                    alive.discard(g)
-                applied.append(f"merge: {[g + 1 for g in grp]} are one object — {m.get('reason', '')}")
+        grp = sorted({int(x) - 1 for x in (m.get("instances") or [])} & alive)
+        if len(grp) >= 2 and not _cooccurs(grp):
+            for g in grp[1:]:
+                alive.discard(g)
+            applied.append(f"merge: {[g + 1 for g in grp]} are one object - {m.get('reason', '')}")
 
     for s in (resp.get("split") or []):
-        if float(s.get("confidence", 0)) >= conf_threshold and (int(s.get("instance", 0)) - 1) in alive:
-            n_t = int(s.get("n_target", 2))
-            n_nt = int(s.get("n_non_target", 0))
-            split_delta += (n_t - 1)
-            applied.append(f"split: {object_name} {int(s['instance'])} covers {n_t} real "
-                           f"+ {n_nt} non-target ({n_t - 1:+d}) — {s.get('reason', '')}")
+        ok, why, parsed = validate_count_split(s, frames_by_id, allowed_ids=alive)
+        if not ok:
+            label = s.get("instance", "?") if isinstance(s, dict) else "?"
+            ignored.append(f"split {object_name} {label}: {why}")
+            continue
+        gid = int(parsed["instance_id"])
+        n_t = int(parsed["n_target"])
+        n_nt = int(parsed["n_non_target"])
+        split_delta += (n_t - 1)
+        applied.append(f"split: {object_name} {gid + 1} covers {n_t} real "
+                       f"+ {n_nt} non-target ({n_t - 1:+d}) - {s.get('reason', '')}")
 
-    n_missed = sum(1 for m in (resp.get("missed") or [])
-                   if float(m.get("confidence", 0)) >= conf_threshold)
+    n_missed = len(resp.get("missed") or [])
     if n_missed:
         applied.append(f"missed: +{n_missed}")
 
     out["adjusted_count"] = max(0, len(alive) + split_delta + n_missed)
     out["kept_ids"] = sorted(alive)
     out["applied"] = applied
-    out["_conf_threshold"] = conf_threshold
+    out["ignored"] = ignored
     return out
 
 
@@ -422,13 +538,12 @@ class Checker:
         self,
         object_name: str,
         results_3d: dict,
-        conf_threshold: float = 0.7,
     ) -> dict:
         frames = self._frames_for(results_3d, object_name)
         instances = self._instances_for(results_3d, object_name)
         cal = llm_calibrate_count(
             self.llm, object_name, frames, instances,
-            memory=self.memory, conf_threshold=conf_threshold,
+            memory=self.memory,
             checker_notes=self.checker_notes,
         )
         cal["summary"] = self.count_summary(object_name, cal)
@@ -600,9 +715,15 @@ Respond with JSON ONLY:
     def count_summary(object_name: str, cal: dict) -> str:
         if cal.get("error"):
             return f"Checker count calibration for {object_name}: unavailable ({cal['error']})"
-        return (f"Checker count calibration for {object_name}: "
-                f"{cal['base_count']} -> {cal['adjusted_count']}; "
-                f"{'; '.join(cal.get('applied', [])) or 'no corrections'}")
+        lines = [f"Checker count calibration for {object_name}: {cal['base_count']} -> {cal['adjusted_count']}"]
+        applied = cal.get("applied") or []
+        if applied:
+            lines.extend(f"- {a}" for a in applied)
+        else:
+            lines.append("- no corrections")
+        ignored = cal.get("ignored") or []
+        lines.extend(f"- ignored invalid correction: {a}" for a in ignored[:3])
+        return "\n".join(lines)
 
     @staticmethod
     def location_summary(loc: dict) -> str:

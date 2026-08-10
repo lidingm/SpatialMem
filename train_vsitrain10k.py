@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 os.environ.setdefault("LLM_BASE_URL",  "http://10.130.138.46:8010/v1")
-os.environ.setdefault("LLM_API_KEY",   "sk-ZAJy47c5eid1MW_wjx7Fpg")
+os.environ.setdefault("LLM_API_KEY",   "EMPTY")
 os.environ.setdefault("LLM_MODEL",     "qwen3.6-plus")
 os.environ.setdefault("SAM3_REPO",     "/home/zhouruofan/Training-Free/tool_model/sam3")
 os.environ.setdefault("SAM3_CHECKPOINT", "/home/zhouruofan/Training-Free/tool_model/sam3.1/sam3.1_multiplex.pt")
@@ -256,7 +256,7 @@ def main():
     reasoner  = Reasoner(llm)
     reflector = Reflector(llm)
     orch      = Orchestrator(tools, memory, skill_lib, planner, reasoner, reflector,
-                             verbose=args.verbose)
+                             verbose=args.verbose, allow_post_skill_reflection=False)
 
     evolve = not args.no_evolve
     from agent.config import PENDING_PROMOTE_K
@@ -380,17 +380,16 @@ def main():
                                 reflector, orch, llm, evaluate_answer,
                                 verbose=args.verbose,
                             )
-                            parts = [f"path={update['path']}"]
-                            if update.get("skill_updates"):
-                                parts.append(f"skill_updates={update['skill_updates']}")
+                            parts = [
+                                f"path={update.get('path')}",
+                                f"used_skill={result.chosen_skill or 'none'}",
+                                f"skill_updates={update.get('skill_updates') or 'none'}",
+                                f"new_skill={update.get('pending_saved') or 'none'}",
+                                f"bootstrapped={update.get('bootstrapped') or 'none'}",
+                            ]
                             if update.get("memory_updates"):
                                 parts.append(f"mem={update['memory_updates']}")
-                            if update.get("pending_saved"):
-                                parts.append(f"NEW_SKILL={update['pending_saved']}")
-                            if update.get("bootstrapped"):
-                                parts.append(f"BOOTSTRAPPED={update['bootstrapped']}")
-                            if args.verbose:
-                                print(f"[EVOLVE] {'  '.join(parts)}")
+                            print(f"[EVOLVE] {'  '.join(parts)}")
                         except Exception:
                             traceback.print_exc()
                             print("[EVOLVE] evolution step failed, continuing.")
