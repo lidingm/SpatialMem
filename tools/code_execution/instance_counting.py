@@ -22,6 +22,7 @@ def count_unique_instances(
     object_name: str | None = None,
     memory=None,
     checker_notes: str | None = None,
+    context_summary: str | None = None,
 ) -> dict:
     """Count unique instances from 3D localization results (after clustering).
 
@@ -45,8 +46,10 @@ def count_unique_instances(
 
     if llm is not None and object_name and frames and instances is not None:
         from agent.checker import Checker
-        cal = Checker(llm, memory=memory, checker_notes=checker_notes).calibrate_count(
-            object_name, results_3d)
+        cal = Checker(
+            llm, memory=memory, checker_notes=checker_notes,
+            context_summary=context_summary,
+        ).calibrate_count(object_name, results_3d)
         result["calibration"] = cal
         if cal.get("error") is None:
             result["total_unique"] = cal["adjusted_count"]

@@ -52,7 +52,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 os.environ.setdefault("LLM_BASE_URL",  "http://10.130.138.46:8010/v1")
-os.environ.setdefault("LLM_API_KEY",   "sk-ZAJy47c5eid1MW_wjx7Fpg")
+os.environ.setdefault("LLM_API_KEY",   "sk-Vd4l7HmLN1NK2MVi0NEKRA")
 os.environ.setdefault("LLM_MODEL",     "qwen3.6-plus")
 os.environ.setdefault("SAM3_REPO",     "/home/zhouruofan/Training-Free/tool_model/sam3")
 os.environ.setdefault("SAM3_CHECKPOINT", "/home/zhouruofan/Training-Free/tool_model/sam3.1/sam3.1_multiplex.pt")
@@ -159,6 +159,7 @@ def load_test_samples(jsonl_path: str, images_root: Path):
                     "dataset": str(r["dataset"]),
                     "scene_name": str(r["scene_name"]),
                     "question_type": qt,
+                    "question_raw": str(r["question"]),
                     "options": list(options) if has_options else None,
                 },
             )

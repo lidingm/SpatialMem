@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+import sys
 from typing import Any
 
 
@@ -19,6 +21,15 @@ CALIBRATE_SYSTEM = (
     "provided visual evidence, and correct clear visual mistakes when the evidence "
     "supports it. Respond with valid JSON only."
 )
+
+
+
+def _maybe_print_count_checker_raw(object_name: str, resp: dict) -> None:
+    # Notebook-only debugging aid; regular train/eval scripts do not load ipykernel.
+    if 'ipykernel' not in sys.modules:
+        return
+    print(f'[CHECKER RAW] count/{object_name}:')
+    print(json.dumps(resp, ensure_ascii=False, indent=2))
 
 
 def _b64_image(path: str, max_side: int = 640) -> str:
@@ -56,6 +67,20 @@ Relevant Checker experience from the active SKILL:
 
 Use these notes only when they apply to the current visual evidence. They are
 past Checker-specific lessons, not a substitute for inspecting the frames.
+"""
+
+
+def _context_summary_block(context_summary: str | None) -> str:
+    summary = str(context_summary or "").strip()
+    if not summary:
+        return ""
+    return f"""
+Previous pipeline evidence summary:
+{summary}
+
+Use this summary as auxiliary context about earlier tool results and decisions.
+If it conflicts with the current annotated images or candidate list, trust the
+visual evidence and the current candidate list.
 """
 
 
@@ -161,7 +186,8 @@ def validate_count_split(split: dict, frames_by_id: dict[int, set[int]],
 LEGACY_BUILD_CALIBRATION_PROMPT_REFERENCE = '''
 def build_calibration_prompt(object_name: str, instances: list[dict],
                              n_frames: int, prior_str: str,
-                             checker_notes: str | None = None) -> str:
+                             checker_notes: str | None = None,
+                             context_summary: str | None = None) -> str:
     inst_lines = "\n".join(
         f"  - {it['label']}: color={it['color']}, appears in frames {it['frames']}, "
         f"3D size {it['bbox_size_m'][0]:.2f} x {it['bbox_size_m'][1]:.2f} x "
@@ -288,7 +314,8 @@ Respond with JSON ONLY, exactly this schema:
 
 def build_calibration_prompt(object_name: str, instances: list[dict],
                              n_frames: int, prior_str: str,
-                             checker_notes: str | None = None) -> str:
+                             checker_notes: str | None = None,
+                             context_summary: str | None = None) -> str:
     inst_lines = "\n".join(
         f"  - {it['label']}: color={it['color']}, appears in frames {it['frames']}, "
         f"3D size {it['bbox_size_m'][0]:.2f} x {it['bbox_size_m'][1]:.2f} x "
@@ -303,6 +330,8 @@ Each candidate is drawn with a colored box and label like "{object_name} N".
 
 CURRENT RESULT - {len(instances)} candidate instance(s):
 {inst_lines}
+{_checker_notes_block(checker_notes)}
+{_context_summary_block(context_summary)}
 
 Use the common everyday understanding of the category "{object_name}". Count objects
 that people would normally recognize as members, common subtypes, or normal functional variants
@@ -411,6 +440,7 @@ def llm_calibrate_count(
     max_side: int = 640,
     max_tokens: int = 2000,
     checker_notes: str | None = None,
+    context_summary: str | None = None,
 ) -> dict:
     base_ids = [int(it["id"]) for it in instances]
     out = {"base_count": len(base_ids), "adjusted_count": len(base_ids),
@@ -424,7 +454,8 @@ def llm_calibrate_count(
         "type": "text",
         "text": build_calibration_prompt(object_name, instances,
                                          len(annotated_frames), prior_str,
-                                         checker_notes=checker_notes),
+                                         checker_notes=checker_notes,
+                                         context_summary=context_summary),
     }]
     for i, fp in enumerate(annotated_frames):
         try:
@@ -445,6 +476,7 @@ def llm_calibrate_count(
         out["error"] = f"llm call failed: {e}"
         return out
     out["raw"] = resp
+    _maybe_print_count_checker_raw(object_name, resp)
 
     alive = set(base_ids)
     applied: list[str] = []
@@ -513,13 +545,18 @@ def _answer_format_instruction(answer_format: str) -> str:
 
 
 class Checker:
-    def __init__(self, llm, memory=None, checker_notes: str | None = None):
+    def __init__(self, llm, memory=None, checker_notes: str | None = None,
+                 context_summary: str | None = None):
         self.llm = llm
         self.memory = memory
         self.checker_notes = str(checker_notes or "").strip()
+        self.context_summary = str(context_summary or "").strip()
 
     def set_checker_notes(self, checker_notes: str | None) -> None:
         self.checker_notes = str(checker_notes or "").strip()
+
+    def set_context_summary(self, context_summary: str | None) -> None:
+        self.context_summary = str(context_summary or "").strip()
 
     @staticmethod
     def _instances_for(results_3d: dict, object_name: str) -> list[dict]:
@@ -545,6 +582,7 @@ class Checker:
             self.llm, object_name, frames, instances,
             memory=self.memory,
             checker_notes=self.checker_notes,
+            context_summary=self.context_summary,
         )
         cal["summary"] = self.count_summary(object_name, cal)
         return cal
@@ -586,6 +624,7 @@ small same-colored label like "{object_name} 1".
 Candidate tracks:
 {lines}
 {_checker_notes_block(self.checker_notes)}
+{_context_summary_block(self.context_summary)}
 
 Pick the ONE track that is genuinely the target "{object_name}". Then split that picked
 track's frames into:
@@ -677,6 +716,7 @@ Question:
 
 Required answer format: {_answer_format_instruction(answer_format)}
 {_checker_notes_block(self.checker_notes)}
+{_context_summary_block(self.context_summary)}
 
 Respond with JSON ONLY:
 {{

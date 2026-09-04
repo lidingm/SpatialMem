@@ -199,12 +199,12 @@ def compute_instance_3d_positions(
     extrinsics: np.ndarray,
     distance_threshold: float = 0.5,
     bbox_percentile: float = 2.0,
-    iou_threshold: float = 0.30,
-    ios_threshold: float = 0.60,
-    ios_threshold_small: float = 0.30,
+    iou_threshold: float = 0.20,
+    ios_threshold: float = 0.45,
+    ios_threshold_small: float = 0.20,
     ios_small_diag: float = 0.5,
     ios_large_diag: float = 1.2,
-    centroid_frac: float = 0.30,
+    centroid_frac: float = 0.40,
     frame_paths: Sequence[str] | None = None,
     object_name: str | None = None,
     output_dir: str | Path | None = None,
@@ -240,9 +240,9 @@ def compute_instance_3d_positions(
     Merge thresholds (stage B), tune for precision/recall of the merge:
       iou_threshold  - min 3D IoU to merge (default 0.30)
       ios_threshold  - min 3D intersection-over-smaller to merge, for LARGE
-                       objects (smaller box diagonal >= ios_large_diag). (0.60)
+                       objects (smaller box diagonal >= ios_large_diag). (0.45)
       ios_threshold_small - same, for SMALL objects (diagonal <= ios_small_diag).
-                       (0.30) Rationale: a fixed depth-noise displacement eats a
+                       (0.20) Rationale: a fixed depth-noise displacement eats a
                        larger FRACTION of a small object, dropping its IoS with
                        the parent even when it's the same object — so require
                        less overlap when the smaller object is small. The
@@ -251,7 +251,7 @@ def compute_instance_3d_positions(
       ios_small_diag / ios_large_diag - diagonal (m) endpoints of the ramp
                        (defaults 0.5 and 1.2).
       centroid_frac  - merge if centroid distance <= this * smaller box diagonal
-                       (default 0.30; higher merges depth-noise fragments but
+                       (default 0.40; higher merges depth-noise fragments but
                        risks chain-merging distinct nearby objects)
     `distance_threshold` is kept for backward compatibility and is unused.
 

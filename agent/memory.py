@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import json
 import math
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -207,11 +208,21 @@ class Memory:
         p = self.root / filename
         if not p.exists():
             return {}
-        return json.loads(p.read_text(encoding="utf-8"))
+        # Readers use the same sidecar lock as writers so parallel training
+        # never observes a file while another process is rewriting it.
+        with _file_lock(p):
+            text = p.read_text(encoding="utf-8").strip()
+            if not text:
+                return {}
+            return json.loads(text)
 
     @staticmethod
     def _write_json(path: Path, data: dict) -> None:
-        path.write_text(
+        # Write atomically: create a complete temp file, then replace the target.
+        # This prevents other processes from seeing an empty/partial JSON file.
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(
             json.dumps(data, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        tmp.replace(path)

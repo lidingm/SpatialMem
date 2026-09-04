@@ -469,6 +469,8 @@ class ToolRegistry:
     def execute_tool(self, tool_name: str, params: dict,
                      frame_paths: list[str]) -> dict:
         prev_checker_len = len(self._context.get("checker_summaries", []))
+        if self.checker is not None:
+            self.checker.set_context_summary(self.get_context_summary())
         try:
             result = self._dispatch(tool_name, params, frame_paths)
             entry = {"tool_name": tool_name, "params": params,
@@ -815,6 +817,7 @@ class ToolRegistry:
             object_name=self._context.get("text_prompt"),
             memory=self.memory,
             checker_notes=self._context.get("active_skill_checker_notes", ""),
+            context_summary=self.get_context_summary(),
         )
         self._context["counting"] = c
         cal = c.get("calibration")
